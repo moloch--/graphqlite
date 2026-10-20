@@ -18,6 +18,11 @@ SQLite scalar subqueries, projections and property assignment. JSON-looking
 strings remain strings. These fixes are relevant to both Cirro and ordinary
 GraphQLite queries.
 
+The `set_typed_expression_values` capability covers evaluated `SET` maps and
+list expressions that retain their value types. The `string_case_aliases`
+capability covers `lower()` and `upper()` aliases for `toLower()` and
+`toUpper()`. Both are advertised by `cypher_capabilities()`.
+
 ## Reproduce the checks
 
 Use a separate Cirro checkout. Its templates are read at test time, not copied
@@ -49,19 +54,21 @@ python tests/cirro/check.py --cirro-root ../cirro \
 ```
 
 The corpus validates all 142 templates and executes all 19 postprocessing
-queries on empty graphs. Nine populated fixtures exercise users and groups,
+queries on empty graphs. Ten populated fixtures exercise users and groups,
 conditional resources, nested networks, dynamic properties and relationships,
-Tailscale, serialized settings, vault versions, and deduplication with incident
-edge properties. Repeat imports check idempotence. This is targeted query and
-binding coverage; it does not run live cloud collection or every possible
-resource payload.
+Tailscale, serialized settings, vault versions, deduplication with incident
+edge properties, and rollback when a computed `SET` expression fails. Repeat
+imports check idempotence. This is targeted query and binding coverage; it
+does not run live cloud collection or every possible resource payload.
 
 ## Using the fork from Cirro
 
-Cirro still needs an optional backend adapter and feature/configuration switch.
-This dependency fork does not change Cirro or its existing backend. The Rust
-crate can be used from a Git revision with `default-features = false`; load the
-locally built extension with `Connection::open_with_extension`. The default
+The [Cirro fork's optional GraphQLite backend](https://github.com/moloch--/cirro/blob/feat/graphqlite-backend/docs/usage/graphqlite.md)
+uses this dependency while keeping Neo4j as its default backend. Its guide
+covers the feature switch, native extension build, ingestion, and export.
+The Rust crate can also be used from a Git revision with
+`default-features = false`; load the locally built extension with
+`Connection::open_with_extension`. The default
 `bundled-extension` feature expects platform binaries under `bindings/rust/libs`;
 building the source checkout alone does not publish those assets. `angreal test
 rust` installs the current platform's extension there for local binding tests.

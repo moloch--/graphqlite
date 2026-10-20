@@ -223,6 +223,8 @@ char *cypher_expr_tag_sql(cypher_transform_context *ctx, ast_node *expr, const c
             }
         case AST_NODE_LIST:
         case AST_NODE_MAP:
+        case AST_NODE_LIST_COMPREHENSION:
+        case AST_NODE_MAP_PROJECTION:
             return strdup("'json'");
         case AST_NODE_SUBSCRIPT: {
             cypher_subscript *sub = (cypher_subscript *)expr;
@@ -292,7 +294,12 @@ char *cypher_expr_tag_sql(cypher_transform_context *ctx, ast_node *expr, const c
                         return out;
                     }
                 }
-                if (!strcasecmp(n, "collect")) return strdup("'json'");
+                static const char *const json_fns[] = {
+                    "collect", "keys", "range", "split", "tail", "labels",
+                    "nodes", "relationships", "properties", NULL
+                };
+                for (int k = 0; json_fns[k]; k++)
+                    if (!strcasecmp(n, json_fns[k])) return strdup("'json'");
                 if (!strcasecmp(n, "count") || !strcasecmp(n, "sum") || !strcasecmp(n, "avg") ||
                     !strncasecmp(n, "stDev", 5) || !strncasecmp(n, "percentile", 10)) return NULL;
             }
@@ -1964,87 +1971,52 @@ static int transform_expression_inner(cypher_transform_context *ctx, ast_node *e
 
         case AST_NODE_LIST_COMPREHENSION:
             {
-                /* Transform list comprehension: [x IN list WHERE cond | transform]
-                 * to: (SELECT json_group_array(transform_expr) FROM json_each(list_expr) WHERE cond_expr)
-                 */
-                cypher_list_comprehension *comp = (cypher_list_comprehension*)expr;
-
-                if (!comp->list_expr) {
-                    ctx->has_error = true;
-                    ctx->error_message = strdup("List comprehension requires list expression");
-                    return -1;
-                }
-
-                /* Store the comprehension variable for use in nested expressions */
-                const char *comp_var = comp->variable;
-
-                /* Save the old alias if this variable name already exists */
-                const char *old_alias = transform_var_get_alias(ctx->var_ctx, comp_var);
-                char *saved_alias = old_alias ? strdup(old_alias) : NULL;
-
-                /* Register the comprehension variable to map to json_each.value,
-                 * with the element's type tag, so a boolean stays a boolean
-                 * (`x < value` with booleans, toString(true) gave '1'). */
-                transform_var_register_projected(ctx->var_ctx, comp_var, "json_each.value");
-                const char *old_tag = transform_var_get_tag(ctx->var_ctx, comp_var);
-                char *saved_tag = old_tag ? strdup(old_tag) : NULL;
-                transform_var_set_tag(ctx->var_ctx, comp_var,
-                    "(CASE json_each.type WHEN 'true' THEN 'bool' WHEN 'false' THEN 'bool' "
-                    "WHEN 'array' THEN 'json' WHEN 'object' THEN 'json' WHEN 'text' THEN 'text' END)");
-
-                /* Build the subquery */
-                append_sql(ctx, "(SELECT json_group_array(");
-
-                /* The result expression - either the transform or the element itself */
-                if (comp->transform_expr &&
-                    !(comp->transform_expr->type == AST_NODE_IDENTIFIER &&
-                      strcmp(((cypher_identifier*)comp->transform_expr)->name, comp_var) == 0)) {
-                    /* Boolean results stay JSON booleans in the list: SQLite's
-                     * json_group_array only keeps its own JSON subtype
-                     * (GQLITE-T-0387). */
-                    bool as_bool = ast_yields_boolean(comp->transform_expr);
-                    if (as_bool) append_sql(ctx, "json(CASE _gql_bool(");
-                    if (transform_expression(ctx, comp->transform_expr) < 0) {
-                        if (saved_alias) free(saved_alias);
-                        return -1;
-                    }
-                    if (as_bool) append_sql(ctx, ") WHEN 1 THEN 'true' WHEN 0 THEN 'false' END)");
-                } else {
-                    /* The element itself ([x IN l] or [x IN l | x]); JSON true/false stay booleans
-                     * (json_each.value gives 1/0, GQLITE-T-0387) */
-                    append_sql(ctx, JSON_EACH_ELEMENT);
-                }
-
-                append_sql(ctx, ") FROM json_each(");
-
-                /* The source list - transform BEFORE adding comprehension variable binding */
-                if (transform_expression(ctx, comp->list_expr) < 0) {
-                    if (saved_alias) free(saved_alias);
-                    return -1;
-                }
-
-                append_sql(ctx, ")");
-
-                /* Optional WHERE filter */
-                if (comp->where_expr) {
-                    append_sql(ctx, " WHERE ");
-                    if (transform_condition(ctx, comp->where_expr) < 0) {
-                        if (saved_alias) free(saved_alias);
-                        return -1;
+                cypher_list_comprehension *comp = (cypher_list_comprehension *)expr;
+                /* The input is in the parent scope. Each nested comprehension
+                 * gets a distinct SQL alias, even when Cypher names shadow. */
+                char *input = transform_expression_to_string(ctx, comp->list_expr);
+                if (!input) return -1;
+                int saved_count = transform_var_count(ctx->var_ctx);
+                int shadow_index = -1;
+                transform_var shadow = {0};
+                for (int i = 0; i < saved_count; i++) {
+                    transform_var *v = transform_var_at(ctx->var_ctx, i);
+                    if (v->name && !strcmp(v->name, comp->variable)) {
+                        shadow_index = i;
+                        shadow = *v;
+                        /* Move ownership out until the local scope is gone. */
+                        memset(v, 0, sizeof(*v));
+                        break;
                     }
                 }
-
-                append_sql(ctx, ")");
-
-                /* Restore the old alias if there was one, otherwise remove the variable */
-                transform_var_set_tag(ctx->var_ctx, comp_var, saved_tag);
-                free(saved_tag);
-                if (saved_alias) {
-                    transform_var_register_projected(ctx->var_ctx, comp_var, saved_alias);
-                    free(saved_alias);
+                char alias[48], value[64], tag[256];
+                snprintf(alias, sizeof(alias), "_comp_%d", ctx->quantifier_counter++);
+                snprintf(value, sizeof(value), "%s.value", alias);
+                snprintf(tag, sizeof(tag),
+                    "(CASE %s.type WHEN 'true' THEN 'bool' WHEN 'false' THEN 'bool' "
+                    "WHEN 'array' THEN 'json' WHEN 'object' THEN 'json' WHEN 'text' THEN 'text' END)", alias);
+                int rc = transform_var_register_projected(ctx->var_ctx, comp->variable, value);
+                if (rc >= 0) rc = transform_var_set_tag(ctx->var_ctx, comp->variable, tag);
+                char *body = NULL, *body_tag = NULL, *where = NULL;
+                if (rc >= 0) {
+                    body = comp->transform_expr
+                        ? transform_expression_to_string(ctx, comp->transform_expr) : strdup(value);
+                    body_tag = comp->transform_expr
+                        ? cypher_expr_tag_sql(ctx, comp->transform_expr, body) : strdup(tag);
+                    if (comp->where_expr) where = condition_to_string(ctx, comp->where_expr);
+                    if (!body || (comp->where_expr && !where)) rc = -1;
                 }
-                /* If there was no old alias, leave the variable as is - it won't conflict
-                 * with anything since list comprehension creates a new scope */
+                if (rc >= 0) {
+                    append_sql(ctx, "(CASE WHEN (%s) IS NULL THEN NULL ELSE "
+                        "(SELECT json_group_array(_gql_json_elem(_gql_retag(%s, %s))) "
+                        "FROM json_each(%s) AS %s", input, body, body_tag ? body_tag : "NULL", input, alias);
+                    if (where) append_sql(ctx, " WHERE %s", where);
+                    append_sql(ctx, ") END)");
+                }
+                free(input); free(body); free(body_tag); free(where);
+                transform_var_truncate_to(ctx->var_ctx, saved_count);
+                if (shadow_index >= 0) *transform_var_at(ctx->var_ctx, shadow_index) = shadow;
+                if (rc < 0) return -1;
             }
             break;
 

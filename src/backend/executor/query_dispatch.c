@@ -4521,48 +4521,108 @@ static int rw_scope_after_prefix(ast_list *clauses, int prefix_len, char ***out_
     return n;
 }
 
-/* Does `expr` reference only scalar bindings of `row` (and literals)? */
-static bool rw_expr_scalar_only(ast_node *expr, const rw_row *row)
+typedef struct rw_local_scope {
+    const char *name;
+    const struct rw_local_scope *parent;
+} rw_local_scope;
+
+/* Comprehension variables are local values, including when their name
+ * shadows an entity or another comprehension variable in the outer row.
+ * The input expression is evaluated before introducing the local name. */
+static bool rw_expr_scalar_in_scope(ast_node *expr, const rw_row *row,
+                                    const rw_local_scope *locals)
 {
     if (!expr) return true;
     switch (expr->type) {
         case AST_NODE_LITERAL: return true;
         case AST_NODE_PARAMETER: return true;
-        case AST_NODE_IDENTIFIER: return rw_row_scalar(row, ((cypher_identifier*)expr)->name) != NULL;
+        case AST_NODE_IDENTIFIER: {
+            const char *name = ((cypher_identifier*)expr)->name;
+            for (const rw_local_scope *local = locals; local; local = local->parent)
+                if (local->name && strcmp(local->name, name) == 0) return true;
+            return rw_row_scalar(row, name) != NULL;
+        }
         case AST_NODE_PROPERTY:   /* #124: row.key on an UNWIND map */
-            return rw_expr_scalar_only(((cypher_property*)expr)->expr, row);
+            return rw_expr_scalar_in_scope(((cypher_property*)expr)->expr, row, locals);
+        case AST_NODE_NOT_EXPR:
+            return rw_expr_scalar_in_scope(((cypher_not_expr*)expr)->expr, row, locals);
+        case AST_NODE_NULL_CHECK:
+            return rw_expr_scalar_in_scope(((cypher_null_check*)expr)->expr, row, locals);
         case AST_NODE_BINARY_OP: {
             cypher_binary_op *b = (cypher_binary_op*)expr;
-            return rw_expr_scalar_only(b->left, row) && rw_expr_scalar_only(b->right, row);
+            return rw_expr_scalar_in_scope(b->left, row, locals) &&
+                   rw_expr_scalar_in_scope(b->right, row, locals);
         }
         case AST_NODE_FUNCTION_CALL: {
             cypher_function_call *f = (cypher_function_call*)expr;
             if (aggregating_call_name(expr)) return false;
             if (!f->args) return true;
-            for (int i = 0; i < f->args->count; i++) if (!rw_expr_scalar_only(f->args->items[i], row)) return false;
+            for (int i = 0; i < f->args->count; i++)
+                if (!rw_expr_scalar_in_scope(f->args->items[i], row, locals)) return false;
             return true;
         }
         case AST_NODE_MAP: {
             ast_list *pairs = ((cypher_map*)expr)->pairs;
             for (int i = 0; pairs && i < pairs->count; i++) {
                 cypher_map_pair *pair = (cypher_map_pair*)pairs->items[i];
-                if (pair && !rw_expr_scalar_only(pair->value, row)) return false;
+                if (pair && !rw_expr_scalar_in_scope(pair->value, row, locals)) return false;
             }
             return true;
         }
         case AST_NODE_LIST: {
             cypher_list *l = (cypher_list*)expr;
             if (!l->items) return true;
-            for (int i = 0; i < l->items->count; i++) if (!rw_expr_scalar_only(l->items->items[i], row)) return false;
+            for (int i = 0; i < l->items->count; i++)
+                if (!rw_expr_scalar_in_scope(l->items->items[i], row, locals)) return false;
+            return true;
+        }
+        case AST_NODE_LIST_COMPREHENSION: {
+            cypher_list_comprehension *c = (cypher_list_comprehension*)expr;
+            rw_local_scope local = {c->variable, locals};
+            return rw_expr_scalar_in_scope(c->list_expr, row, locals) &&
+                   rw_expr_scalar_in_scope(c->where_expr, row, &local) &&
+                   rw_expr_scalar_in_scope(c->transform_expr, row, &local);
+        }
+        case AST_NODE_LIST_PREDICATE: {
+            cypher_list_predicate *p = (cypher_list_predicate*)expr;
+            rw_local_scope local = {p->variable, locals};
+            return rw_expr_scalar_in_scope(p->list_expr, row, locals) &&
+                   rw_expr_scalar_in_scope(p->predicate, row, &local);
+        }
+        case AST_NODE_REDUCE_EXPR: {
+            cypher_reduce_expr *r = (cypher_reduce_expr*)expr;
+            rw_local_scope accumulator = {r->accumulator, locals};
+            rw_local_scope element = {r->variable, &accumulator};
+            return rw_expr_scalar_in_scope(r->initial_value, row, locals) &&
+                   rw_expr_scalar_in_scope(r->list_expr, row, locals) &&
+                   rw_expr_scalar_in_scope(r->expression, row, &element);
+        }
+        case AST_NODE_CASE_EXPR: {
+            cypher_case_expr *c = (cypher_case_expr*)expr;
+            if (!rw_expr_scalar_in_scope(c->operand, row, locals) ||
+                !rw_expr_scalar_in_scope(c->else_expr, row, locals)) return false;
+            for (int i = 0; c->when_clauses && i < c->when_clauses->count; i++) {
+                cypher_when_clause *w = (cypher_when_clause*)c->when_clauses->items[i];
+                if (w && (!rw_expr_scalar_in_scope(w->condition, row, locals) ||
+                          !rw_expr_scalar_in_scope(w->result, row, locals))) return false;
+            }
             return true;
         }
         case AST_NODE_SUBSCRIPT: {
             cypher_subscript *s = (cypher_subscript*)expr;
-            return rw_expr_scalar_only(s->expr, row) && rw_expr_scalar_only(s->index, row) &&
-                   rw_expr_scalar_only(s->slice_start, row) && rw_expr_scalar_only(s->slice_end, row);
+            return rw_expr_scalar_in_scope(s->expr, row, locals) &&
+                   rw_expr_scalar_in_scope(s->index, row, locals) &&
+                   rw_expr_scalar_in_scope(s->slice_start, row, locals) &&
+                   rw_expr_scalar_in_scope(s->slice_end, row, locals);
         }
         default: return false;
     }
+}
+
+/* Does `expr` reference only scalar bindings of `row` (and local values)? */
+static bool rw_expr_scalar_only(ast_node *expr, const rw_row *row)
+{
+    return rw_expr_scalar_in_scope(expr, row, NULL);
 }
 
 /* Evaluate a scalar-only expression for a row. Returns the SQLite type;
@@ -4588,12 +4648,24 @@ static int rw_eval_scalar(cypher_executor *executor, ast_node *expr, const rw_ro
         transform_var_register_projected(ctx->var_ctx, sc->name, ref);
         transform_var_set_bound(ctx->var_ctx, sc->name, true);
         transform_var_set_scalar_value(ctx->var_ctx, sc->name, true);
+        if (sc->type == GQL_COL_TYPE_STRING)
+            transform_var_set_tag(ctx->var_ctx, sc->name, "'text'");
+        else if (sc->type == GQL_COL_TYPE_BOOLEAN)
+            transform_var_set_tag(ctx->var_ctx, sc->name, "'bool'");
+        else if (sc->text && (sc->type == GQL_COL_TYPE_JSON ||
+                 (sc->type == SQLITE_TEXT && (sc->text[0] == '[' || sc->text[0] == '{'))))
+            transform_var_set_tag(ctx->var_ctx, sc->name, "'json'");
     }
     char *sql_expr = cypher_transform_capture_expression(ctx, expr);
+    char *tag_sql = sql_expr ? cypher_expr_tag_sql(ctx, expr, sql_expr) : NULL;
     cypher_transform_free_context(ctx);
     if (!sql_expr) return -1;
-    char *sql = sqlite3_mprintf("SELECT %s", sql_expr);
+    /* A scalar subquery drops SQLite's JSON subtype. Carry the Cypher tag
+     * separately so list comprehensions/keys() stay lists, while toJson()
+     * and other strings that contain JSON remain strings. */
+    char *sql = sqlite3_mprintf("SELECT %s, %s", sql_expr, tag_sql ? tag_sql : "NULL");
     free(sql_expr);
+    free(tag_sql);
     sqlite3_stmt *st = sql ? cypher_executor_helper_stmt(executor, sql) : NULL;
     int type = -1;
     if (st) {
@@ -4622,6 +4694,12 @@ static int rw_eval_scalar(cypher_executor *executor, ast_node *expr, const rw_ro
             if (type == SQLITE_TEXT)
                 type = cv && sqlite3_value_subtype(cv) == GQL_SUBTYPE_JSON
                     ? GQL_COL_TYPE_JSON : GQL_COL_TYPE_STRING;
+            const char *tag = (const char*)sqlite3_column_text(st, 1);
+            if (type != SQLITE_NULL && tag) {
+                if (strcmp(tag, "bool") == 0) type = GQL_COL_TYPE_BOOLEAN;
+                else if (strcmp(tag, "json") == 0) type = GQL_COL_TYPE_JSON;
+                else if (strcmp(tag, "text") == 0) type = GQL_COL_TYPE_STRING;
+            }
             *out_text = v ? strdup(v) : NULL;
         }
         sqlite3_reset(st);

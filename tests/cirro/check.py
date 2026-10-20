@@ -126,6 +126,7 @@ def users_groups(g):
     require(set(nodes) == {'u1', 'u2', 'g1'}, f'Unexpected nodes: {nodes}')
     require(nodes['u1']['properties']['accountEnabled'] is True, 'True property lost')
     require(nodes['u2']['properties']['accountEnabled'] is False, 'False property lost')
+    require(all(n['properties'].get('odataType') == '#microsoft.graph.directoryobject' for n in nodes.values()), 'OData type expression lost')
     require(set(nodes['u1']['labels']) == {'GraphObject', 'GraphUser'}, 'User labels changed')
     require(g.edges() == {('u1', 'MEMBER_OF', 'g1'), ('u2', 'MANAGES', 'u1'), ('u2', 'OWNS', 'g1')}, f'Wrong relationships: {g.edges()}')
     before = g.snapshot(); ingest(); require(g.snapshot() == before, 'Repeated users/groups ingestion changed graph')
@@ -140,6 +141,8 @@ def conditional_resources(g):
     expected = {('rg','CONTAINS','r1'),('rg','CONTAINS','r2'),('host','MANAGES','r1'),('r1','HAS_IDENTITY','sp'),('r1','HAS_PRIVATE_ENDPOINT','ep')}
     require(g.edges() == expected, f'Conditional branch graph differs: {g.edges()}')
     require({n['id'] for n in g.nodes()} == {'r1','r2','rg','host','sp','ep'}, 'Conditional import lost or added nodes')
+    props = {n['id']: n['properties'] for n in g.nodes()}
+    require(props['r1'].get('tags') == ['env:test'] and props['r2'].get('tags') == [], 'Nonempty/empty resource tags lost')
     before = g.snapshot(); ingest(); require(g.snapshot() == before, 'Conditional import is not idempotent')
 
 
@@ -208,6 +211,8 @@ def vault_versions(g):
     require(g.edges() == {(certificate.rsplit('/',1)[0],'HAS_VERSION',certificate),
                           (secret.rsplit('/',1)[0],'HAS_VERSION',secret)},
             f'Projected imports or regex parent IDs differ: {g.edges()}')
+    props = {n['id']: n['properties'] for n in g.nodes()}
+    require(props[certificate].get('tags') == ['env:test'] and props[secret].get('tags') == [], 'Nonempty/empty vault tags lost')
     before=g.snapshot();ingest();require(g.snapshot()==before, 'Vault versions are not idempotent')
     g.query('CREATE (:ClientSecret {id:"credential", hint:"abc"})')
     g.spec('post_processing/match_vault_secrets_to_creds.tera.yaml')
@@ -229,6 +234,25 @@ def postprocessing(g):
     before=g.snapshot();run();require(g.snapshot()==before, 'Postprocessing is not idempotent')
 
 
+def set_expression_failures(g):
+    g.query('CREATE (:SetFailure {id:1, before:"original", keep:true})')
+    before = g.snapshot()
+    for expression in ['unknownSetFunction(1)', 'apoc.text.replace("x", "[", "")']:
+        try:
+            g.query('MATCH (n:SetFailure) SET n.before="changed", n.fresh=42 '
+                    'SET n += {bad:' + expression + '}')
+        except Exception:
+            pass
+        else:
+            raise AssertionError('Failed SET expression was silently omitted: ' + expression)
+        require(g.snapshot() == before, 'Failed SET did not roll back preceding property writes')
+    # Quoted, escaped, and long property names are decoded without truncation.
+    key = 'quoted"\\key' + 'long' * 100
+    g.query('MATCH (n:SetFailure) SET n += $props', {'props': {key: [True, False], 'raw': '[true]'}})
+    props = g.query('MATCH (n:SetFailure) RETURN properties(n) AS p')[0]['p']
+    require(props.get(key) == [True, False] and props.get('raw') == '[true]', 'Parameter map keys or types changed')
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cirro-root',required=True,type=Path)
@@ -247,7 +271,7 @@ def main():
             try:c.spec(path);report['postprocessing_empty'].append({'file':path,'passed':True})
             except Exception as e:report['postprocessing_empty'].append({'file':path,'passed':False,'error':str(e)})
             finally:c.close()
-    for fn in [users_groups,conditional_resources,nested_network,dynamic_properties,dynamic_relationship,tailscale,serialized_settings,vault_versions,postprocessing]:
+    for fn in [users_groups,conditional_resources,nested_network,dynamic_properties,dynamic_relationship,tailscale,serialized_settings,vault_versions,postprocessing,set_expression_failures]:
         c=Graph(extension,specs,runner)
         try:fn(c);report['fixtures'].append({'name':fn.__name__,'passed':True})
         except Exception as e:report['fixtures'].append({'name':fn.__name__,'passed':False,'error':str(e)})

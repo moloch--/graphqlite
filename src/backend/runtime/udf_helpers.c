@@ -4453,6 +4453,8 @@ static const gql_capability_flag gql_capability_flags[] = {
     {"call_import_projections",       1},  /* CALL (expression AS name) */
     {"conditional_when",              1},  /* WHEN predicate THEN { unit clauses } */
     {"dynamic_property_set",          1},  /* SET entity[key] = value */
+    {"set_typed_expression_values",   1},  /* Typed evaluated SET maps and list expressions */
+    {"string_case_aliases",           1},  /* lower()/upper() aliases */
     {"call_procedures",               1},  /* Algorithms and the named APOC subset below */
     {"apoc_convert_tojson",           1},
     {"apoc_text_replace_posix_regex", 1},

@@ -26,6 +26,8 @@ INSERT INTO _assert SELECT 'scoped CALL', json_extract(cypher_capabilities(), '$
 INSERT INTO _assert SELECT 'projected CALL imports', json_extract(cypher_capabilities(), '$.features.call_import_projections') = 1;
 INSERT INTO _assert SELECT 'conditional WHEN', json_extract(cypher_capabilities(), '$.features.conditional_when') = 1;
 INSERT INTO _assert SELECT 'dynamic property SET', json_extract(cypher_capabilities(), '$.features.dynamic_property_set') = 1;
+INSERT INTO _assert SELECT 'typed SET expression values', json_extract(cypher_capabilities(), '$.features.set_typed_expression_values') = 1;
+INSERT INTO _assert SELECT 'string case aliases', json_extract(cypher_capabilities(), '$.features.string_case_aliases') = 1;
 INSERT INTO _assert SELECT 'named APOC compatibility subset',
   json_extract(cypher_capabilities(), '$.features.apoc_convert_tojson') = 1 AND
   json_extract(cypher_capabilities(), '$.features.apoc_text_replace_posix_regex') = 1 AND

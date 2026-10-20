@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "executor/executor_internal.h"
 #include "transform/transform_helpers.h"
@@ -166,12 +167,20 @@ static int evaluate_ast_with_context_raw(
      * this, `r.num + 1` becomes text "1" || "1" = "11" instead of 2. */
     /* A list or map keeps the types of its elements (a boolean stays a
      * JSON boolean) in value mode (GQLITE-T-0407). */
-    ctx->in_comparison = !(expr->type == AST_NODE_LIST || expr->type == AST_NODE_MAP);
+    ctx->in_comparison = !(expr->type == AST_NODE_LIST || expr->type == AST_NODE_MAP ||
+                           expr->type == AST_NODE_LIST_COMPREHENSION);
     append_sql(ctx, "SELECT ");
     if (transform_expression(ctx, expr) < 0) {
         cypher_transform_free_context(ctx);
         return -1;
     }
+
+    /* SQLite scalar subqueries erase JSON subtypes. Carry the expression's
+     * explicit tag separately so stored lists/maps and booleans keep type. */
+    char *value_sql = strdup(ctx->sql_buffer + strlen("SELECT "));
+    char *tag_sql = value_sql ? cypher_expr_tag_sql(ctx, expr, value_sql) : NULL;
+    append_sql(ctx, ", %s", tag_sql ? tag_sql : "NULL");
+    free(value_sql); free(tag_sql);
 
     /* Build full SQL: SELECT func(...) FROM nodes AS n_0 WHERE n_0.id = X */
     const char *from_str = sql_builder_get_from(ctx->unified_builder);
@@ -203,12 +212,21 @@ static int evaluate_ast_with_context_raw(
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_ROW) {
         sqlite3_finalize(stmt);
-        return -2;
+        return rc == SQLITE_DONE ? -2 : -1;
     }
 
     int col_type = sqlite3_column_type(stmt, 0);
     sqlite3_value *cv0 = sqlite3_column_value(stmt, 0);
-    bool json_sub = cv0 && sqlite3_value_subtype(cv0) == GQL_SUBTYPE_JSON;
+    const char *tag = (const char *)sqlite3_column_text(stmt, 1);
+    bool json_sub = (tag && !strcmp(tag, "json")) ||
+                    (cv0 && sqlite3_value_subtype(cv0) == GQL_SUBTYPE_JSON);
+    if (tag && !strcmp(tag, "bool") && col_type != SQLITE_NULL) {
+        const char *value = (const char *)sqlite3_column_text(stmt, 0);
+        *out_type = PROP_TYPE_BOOLEAN;
+        out_value->as_bool = value && (!strcmp(value, "true") || !strcmp(value, "1"));
+        sqlite3_finalize(stmt);
+        return 0;
+    }
     switch (col_type) {
         case SQLITE_INTEGER:
             *out_type = PROP_TYPE_INTEGER;
@@ -300,6 +318,10 @@ int evaluate_function_call_via_sqlite(
         return -1;
     }
 
+    char *value_sql = strdup(ctx->sql_buffer + strlen("SELECT "));
+    char *tag_sql = value_sql ? cypher_expr_tag_sql(ctx, (ast_node *)func_call, value_sql) : NULL;
+    append_sql(ctx, ", %s", tag_sql ? tag_sql : "NULL");
+    free(value_sql); free(tag_sql);
     sqlite3_stmt *stmt;
     int rc = sqlite3_prepare_v2(executor->db, ctx->sql_buffer, -1, &stmt, NULL);
     cypher_transform_free_context(ctx);
@@ -320,6 +342,9 @@ int evaluate_function_call_via_sqlite(
 
     int col_type = sqlite3_column_type(stmt, 0);
     unsigned subtype = sqlite3_value_subtype(sqlite3_column_value(stmt, 0));
+    const char *tag = (const char *)sqlite3_column_text(stmt, 1);
+    if (tag && !strcmp(tag, "json")) subtype = GQL_SUBTYPE_JSON;
+    if (tag && !strcmp(tag, "bool")) subtype = GQL_SUBTYPE_BOOLEAN;
     if (subtype == GQL_SUBTYPE_BOOLEAN && col_type != SQLITE_NULL) {
         const char *value = (const char *)sqlite3_column_text(stmt, 0);
         *out_type = PROP_TYPE_BOOLEAN;
@@ -367,8 +392,8 @@ int evaluate_function_call_via_sqlite(
     return 0;
 }
 
-/* Parse a JSON object string and set each key-value pair as a property.
- * Follows the same hand-rolled JSON parsing pattern as get_param_value(). */
+/* Decode one evaluated map with SQLite so escaped keys and value types are
+ * preserved. Null values remove existing properties, as required by SET +=. */
 static int set_properties_from_json_object(
     cypher_executor *executor,
     int entity_id,
@@ -376,155 +401,69 @@ static int set_properties_from_json_object(
     const char *json_str,
     cypher_result *result)
 {
-    const char *p = json_str;
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-
-    if (*p != '{') {
-        set_result_error(result, "Bulk SET parameter must be a JSON object");
+    const char *start = json_str;
+    while (start && isspace((unsigned char)*start)) start++;
+    if (!start || *start != '{') {
+        set_result_error(result, "Bulk SET requires a map value");
         return -1;
     }
-    p++;
-
-    while (*p) {
-        while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
-        if (*p == '}') break;
-        if (*p == ',') { p++; continue; }
-
-        /* Parse key */
-        if (*p != '"') {
-            set_result_error(result, "Invalid JSON in bulk SET parameter");
-            return -1;
-        }
-        p++;
-        const char *key_start = p;
-        while (*p && *p != '"') p++;
-        if (!*p) {
-            set_result_error(result, "Unterminated string in bulk SET parameter");
-            return -1;
-        }
-        size_t key_len = p - key_start;
-        char key[256];
-        if (key_len >= sizeof(key)) key_len = sizeof(key) - 1;
-        memcpy(key, key_start, key_len);
-        key[key_len] = '\0';
-        p++; /* closing quote */
-
-        while (*p && *p != ':') p++;
-        if (!*p) break;
-        p++; /* colon */
-        while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
-
-        /* Parse value */
-        property_type pt;
-        char *dyn_str = NULL;  /* Dynamically allocated for string/JSON values */
-        const void *pv = NULL;
-        int64_t json_int_buf;
-        double json_real_buf;
-        int json_bool_buf;
-
-        if (*p == '"') {
-            /* String — scan for length, then allocate */
-            p++;
-            const char *scan = p;
-            size_t raw_len = 0;
-            while (*scan && *scan != '"') {
-                if (*scan == '\\' && *(scan+1)) scan++;
-                scan++;
-                raw_len++;
-            }
-            dyn_str = malloc(raw_len + 1);
-            if (!dyn_str) {
-                set_result_error(result, "Memory allocation failed in bulk SET");
-                return -1;
-            }
-            size_t i = 0;
-            while (*p && *p != '"') {
-                if (*p == '\\' && *(p+1)) {
-                    p++;
-                    i += (size_t)gql_json_decode_escape(&p, dyn_str + i);
-                } else {
-                    dyn_str[i++] = *p++;
-                }
-            }
-            dyn_str[i] = '\0';
-            if (*p == '"') p++;
-            pt = PROP_TYPE_TEXT;
-            pv = dyn_str;
-        } else if (*p == 't') {
-            pt = PROP_TYPE_BOOLEAN;
-            json_bool_buf = 1;
-            pv = &json_bool_buf;
-            while (*p && *p != ',' && *p != '}') p++;
-        } else if (*p == 'f') {
-            pt = PROP_TYPE_BOOLEAN;
-            json_bool_buf = 0;
-            pv = &json_bool_buf;
-            while (*p && *p != ',' && *p != '}') p++;
-        } else if (*p == 'n') {
-            /* null — skip this property */
-            p += 4;
-            continue;
-        } else if (*p == '-' || (*p >= '0' && *p <= '9')) {
-            const char *num_start = p;
-            bool is_float = false;
-            if (*p == '-') p++;
-            while (*p >= '0' && *p <= '9') p++;
-            if (*p == '.') { is_float = true; p++; while (*p >= '0' && *p <= '9') p++; }
-            if (*p == 'e' || *p == 'E') { is_float = true; p++; if (*p == '+' || *p == '-') p++; while (*p >= '0' && *p <= '9') p++; }
-            if (is_float) {
-                pt = PROP_TYPE_REAL;
-                json_real_buf = strtod(num_start, NULL);
-                pv = &json_real_buf;
-            } else {
-                pt = PROP_TYPE_INTEGER;
-                json_int_buf = strtoll(num_start, NULL, 10);
-                pv = &json_int_buf;
-            }
-        } else if (*p == '{' || *p == '[') {
-            /* Nested object/array — store as JSON */
-            const char *json_start = p;
-            int depth = 1;
-            p++;
-            while (*p && depth > 0) {
-                if (*p == '{' || *p == '[') depth++;
-                else if (*p == '}' || *p == ']') depth--;
-                else if (*p == '"') {
-                    p++;
-                    while (*p && *p != '"') {
-                        if (*p == '\\' && *(p+1)) p++;
-                        p++;
-                    }
-                }
-                if (*p) p++;
-            }
-            size_t json_len = p - json_start;
-            dyn_str = malloc(json_len + 1);
-            if (!dyn_str) {
-                set_result_error(result, "Memory allocation failed in bulk SET");
-                return -1;
-            }
-            memcpy(dyn_str, json_start, json_len);
-            dyn_str[json_len] = '\0';
-            pt = PROP_TYPE_JSON;
-            pv = dyn_str;
-        } else {
-            /* Skip unknown value types */
-            while (*p && *p != ',' && *p != '}') p++;
-            continue;
-        }
-
-        int rc;
-        if (is_edge) {
-            rc = cypher_schema_set_edge_property(executor->schema_mgr, entity_id, key, pt, pv);
-        } else {
-            rc = cypher_schema_set_node_property(executor->schema_mgr, entity_id, key, pt, pv);
-        }
-        free(dyn_str);  /* Safe even if NULL */
-        if (rc == 0) {
-            result->properties_set++;
-        }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(executor->db,
+        "SELECT key, type, value FROM json_each(?1)",
+        -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        set_result_error(result, sqlite3_errmsg(executor->db));
+        return -1;
     }
-
+    sqlite3_bind_text(stmt, 1, json_str, -1, SQLITE_TRANSIENT);
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *key = (const char *)sqlite3_column_text(stmt, 0);
+        const char *type = (const char *)sqlite3_column_text(stmt, 1);
+        property_type pt = PROP_TYPE_TEXT;
+        const void *value = NULL;
+        int64_t integer;
+        double real;
+        int boolean;
+        int write_rc;
+        if (!strcmp(type, "null")) {
+            write_rc = is_edge
+                ? cypher_schema_delete_edge_property(executor->schema_mgr, entity_id, key)
+                : cypher_schema_delete_node_property(executor->schema_mgr, entity_id, key);
+            /* The schema delete API returns -1 when a globally known key
+             * is absent on this entity; removing it is a successful no-op. */
+            if (write_rc == 0) result->properties_set++;
+            continue;
+        } else {
+            if (!strcmp(type, "integer")) {
+                pt = PROP_TYPE_INTEGER;
+                integer = sqlite3_column_int64(stmt, 2); value = &integer;
+            } else if (!strcmp(type, "real")) {
+                pt = PROP_TYPE_REAL;
+                real = sqlite3_column_double(stmt, 2); value = &real;
+            } else if (!strcmp(type, "true") || !strcmp(type, "false")) {
+                pt = PROP_TYPE_BOOLEAN;
+                boolean = !strcmp(type, "true"); value = &boolean;
+            } else {
+                pt = !strcmp(type, "array") || !strcmp(type, "object") ? PROP_TYPE_JSON : PROP_TYPE_TEXT;
+                value = sqlite3_column_text(stmt, 2);
+            }
+            write_rc = is_edge
+                ? cypher_schema_set_edge_property(executor->schema_mgr, entity_id, key, pt, value)
+                : cypher_schema_set_node_property(executor->schema_mgr, entity_id, key, pt, value);
+        }
+        if (write_rc != 0) {
+            sqlite3_finalize(stmt);
+            set_result_error(result, "Failed to write property from bulk SET map");
+            return -1;
+        }
+        result->properties_set++;
+    }
+    if (rc != SQLITE_DONE) {
+        set_result_error(result, sqlite3_errmsg(executor->db));
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    sqlite3_finalize(stmt);
     return 0;
 }
 
@@ -866,9 +805,32 @@ int execute_set_operations(cypher_executor *executor, cypher_set *set, variable_
                 return -1;
             }
 
+            /* Determine if node or edge */
+            bool is_edge = is_variable_edge(var_map, var_id->name);
+            int entity_id;
+
+            if (is_edge) {
+                entity_id = get_variable_edge_id(var_map, var_id->name);
+                if (entity_id == GQL_NULL_ENTITY_ID) continue;   /* SET on null does nothing */
+                if (entity_id < 0) {
+                    char error[256];
+                    snprintf(error, sizeof(error), "Unbound edge variable in bulk SET: %s", var_id->name);
+                    set_result_error(result, error);
+                    return -1;
+                }
+            } else {
+                entity_id = get_variable_node_id(var_map, var_id->name);
+                if (entity_id == GQL_NULL_ENTITY_ID) continue;   /* SET on null does nothing */
+                if (entity_id < 0) {
+                    char error[256];
+                    snprintf(error, sizeof(error), "Unbound variable in bulk SET: %s", var_id->name);
+                    set_result_error(result, error);
+                    return -1;
+                }
+            }
+
             /* Resolve the map expression — map literal, parameter, or an
              * entity identifier (SET r = a copies a's properties). */
-            cypher_map *map = NULL;
             char *resolved_json = NULL;
             cypher_identifier *src_entity = NULL;  /* non-NULL => entity-copy RHS */
             property_value param_pv;
@@ -880,7 +842,18 @@ int execute_set_operations(cypher_executor *executor, cypher_set *set, variable_
                  * destination entity id and replace-mode delete are resolved. */
                 src_entity = (cypher_identifier*)item->expr;
             } else if (item->expr->type == AST_NODE_MAP) {
-                map = (cypher_map*)item->expr;
+                /* Evaluate the entire map before any target properties are
+                 * changed. Every expression must be evaluated with its type;
+                 * skipping unsupported AST shapes silently discarded data. */
+                property_type pt;
+                int rc = evaluate_ast_with_context(executor, item->expr, var_map,
+                                                    &pt, &param_pv);
+                if (rc < 0 || pt != PROP_TYPE_JSON) {
+                    property_value_free(&param_pv);
+                    set_result_error(result, "Failed to evaluate map expression in bulk SET");
+                    return -1;
+                }
+                resolved_json = param_pv.as_str;
             } else if (item->expr->type == AST_NODE_PARAMETER && executor->params_json) {
                 cypher_parameter *param = (cypher_parameter*)item->expr;
                 property_type pt;
@@ -904,30 +877,6 @@ int execute_set_operations(cypher_executor *executor, cypher_set *set, variable_
             } else {
                 set_result_error(result, "Bulk SET value must be a map literal or parameter");
                 return -1;
-            }
-
-            /* Determine if node or edge */
-            bool is_edge = is_variable_edge(var_map, var_id->name);
-            int entity_id;
-
-            if (is_edge) {
-                entity_id = get_variable_edge_id(var_map, var_id->name);
-                if (entity_id == GQL_NULL_ENTITY_ID) continue;   /* SET on null does nothing */
-                if (entity_id < 0) {
-                    char error[256];
-                    snprintf(error, sizeof(error), "Unbound edge variable in bulk SET: %s", var_id->name);
-                    set_result_error(result, error);
-                    return -1;
-                }
-            } else {
-                entity_id = get_variable_node_id(var_map, var_id->name);
-                if (entity_id == GQL_NULL_ENTITY_ID) continue;   /* SET on null does nothing */
-                if (entity_id < 0) {
-                    char error[256];
-                    snprintf(error, sizeof(error), "Unbound variable in bulk SET: %s", var_id->name);
-                    set_result_error(result, error);
-                    return -1;
-                }
             }
 
             /* For replace mode (=), delete all existing properties first */
@@ -960,80 +909,7 @@ int execute_set_operations(cypher_executor *executor, cypher_set *set, variable_
                 continue;
             }
 
-            /* Set each property from the map */
-            if (map && map->pairs) {
-                for (int j = 0; j < map->pairs->count; j++) {
-                    cypher_map_pair *pair = (cypher_map_pair*)map->pairs->items[j];
-                    if (!pair || !pair->key || !pair->value) continue;
-
-                    property_type pt = PROP_TYPE_TEXT;
-                    const void *pv = NULL;
-                    char *bulk_json_str = NULL;  /* Dynamically allocated for JSON values */
-
-                    if (pair->value->type == AST_NODE_LITERAL) {
-                        cypher_literal *lit = (cypher_literal*)pair->value;
-                        switch (lit->literal_type) {
-                            case LITERAL_STRING:
-                                pt = PROP_TYPE_TEXT;
-                                pv = lit->value.string;
-                                break;
-                            case LITERAL_INTEGER:
-                                pt = PROP_TYPE_INTEGER;
-                                pv = &lit->value.integer;
-                                break;
-                            case LITERAL_DECIMAL:
-                                pt = PROP_TYPE_REAL;
-                                pv = &lit->value.decimal;
-                                break;
-                            case LITERAL_BOOLEAN:
-                                pt = PROP_TYPE_BOOLEAN;
-                                pv = &lit->value.boolean;
-                                break;
-                            case LITERAL_NULL: {
-                                /* SET n += {k: null} removes property k.
-                                 * In replace mode (SET n = {...}) the
-                                 * earlier delete_all step already handled
-                                 * it, so skip there. */
-                                if (item->is_merge) {
-                                    int removed = 0;
-                                    if (is_edge) {
-                                        removed = (cypher_schema_delete_edge_property(
-                                            executor->schema_mgr, entity_id, pair->key) == 0);
-                                    } else {
-                                        removed = (cypher_schema_delete_node_property(
-                                            executor->schema_mgr, entity_id, pair->key) == 0);
-                                    }
-                                    if (removed) result->properties_set++;
-                                }
-                                continue;
-                            }
-                        }
-                    } else if (pair->value->type == AST_NODE_MAP || pair->value->type == AST_NODE_LIST) {
-                        bulk_json_str = serialize_ast_to_json(pair->value);
-                        if (!bulk_json_str) {
-                            set_result_error(result, "Failed to serialize map/list value in bulk SET");
-                            return -1;
-                        }
-                        pt = PROP_TYPE_JSON;
-                        pv = bulk_json_str;
-                    } else {
-                        continue; /* Skip unsupported value types */
-                    }
-
-                    int rc;
-                    if (is_edge) {
-                        rc = cypher_schema_set_edge_property(executor->schema_mgr, entity_id, pair->key, pt, pv);
-                    } else {
-                        rc = cypher_schema_set_node_property(executor->schema_mgr, entity_id, pair->key, pt, pv);
-                    }
-                    free(bulk_json_str);  /* Safe even if NULL */
-                    if (rc == 0) {
-                        result->properties_set++;
-                    }
-                }
-            }
-
-            /* Set properties from resolved JSON parameter */
+            /* Set properties from the evaluated map or JSON parameter. */
             if (resolved_json) {
                 if (set_properties_from_json_object(executor, entity_id, is_edge,
                                                      resolved_json, result) < 0) {
@@ -1241,7 +1117,7 @@ int execute_set_operations(cypher_executor *executor, cypher_set *set, variable_
                 property_value_free(&set_pv);
                 return -1;
             }
-            if (prop_type == PROP_TYPE_TEXT) {
+            if (prop_type == PROP_TYPE_TEXT || prop_type == PROP_TYPE_JSON) {
                 prop_value = set_pv.as_str;
             } else if (prop_type == PROP_TYPE_INTEGER) {
                 set_int_buf = set_pv.as_int;
@@ -1376,6 +1252,7 @@ int execute_set_operations(cypher_executor *executor, cypher_set *set, variable_
                     item->expr->type == AST_NODE_NULL_CHECK ||
                     item->expr->type == AST_NODE_SUBSCRIPT ||
                     item->expr->type == AST_NODE_LIST ||
+                    item->expr->type == AST_NODE_LIST_COMPREHENSION ||
                     item->expr->type == AST_NODE_MAP)) {
             /* Arbitrary expression RHS: SET n.num = n.num + 1, etc.
              * Evaluate via SQL with the var_map's nodes joined in. */

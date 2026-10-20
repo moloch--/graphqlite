@@ -36,9 +36,11 @@ int transform_string_function(cypher_transform_context *ctx, cypher_function_cal
 
     /* Map Cypher function names to SQLite function names */
     const char *sql_func = NULL;
-    if (strcasecmp(func_call->function_name, "toUpper") == 0) {
+    if (strcasecmp(func_call->function_name, "toUpper") == 0 ||
+        strcasecmp(func_call->function_name, "upper") == 0) {
         sql_func = "UPPER";
-    } else if (strcasecmp(func_call->function_name, "toLower") == 0) {
+    } else if (strcasecmp(func_call->function_name, "toLower") == 0 ||
+               strcasecmp(func_call->function_name, "lower") == 0) {
         sql_func = "LOWER";
     } else if (strcasecmp(func_call->function_name, "trim") == 0 ||
                strcasecmp(func_call->function_name, "btrim") == 0) {

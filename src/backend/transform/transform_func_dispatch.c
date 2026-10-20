@@ -98,6 +98,8 @@ static const transform_func_entry dispatch_table[] = {
     /* String functions - simple transforms */
     {"toUpper",         transform_string_function},
     {"toLower",         transform_string_function},
+    {"upper",           transform_string_function},
+    {"lower",           transform_string_function},
     {"trim",            transform_string_function},
     {"ltrim",           transform_string_function},
     {"rtrim",           transform_string_function},
