@@ -393,7 +393,10 @@ def _pick_python_with_extension_support(verbose: bool = False) -> str | None:
 def test_tck_harness() -> int:
     """Keep harness checks separate from the binding package's tests namespace."""
     python = _pick_python_with_extension_support()
-    if python is None or not ensure_extension_built():
+    if python is None:
+        print("ERROR: no Python with SQLite load_extension support; set GQLITE_TCK_PYTHON.")
+        return 1
+    if not ensure_extension_built():
         return 1
     return subprocess.run([python, "-m", "pytest", "tests/tck/tests", "-q"],
                           cwd=get_project_root()).returncode
