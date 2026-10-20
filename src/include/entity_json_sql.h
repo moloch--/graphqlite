@@ -71,8 +71,8 @@ static inline char *gql_sql_node_json_expr(const char *gprefix, const char *id_e
     if (!props) return NULL;
     char *out = gql_sql_vasprintf(
         "json_object('id', %s, "
-        "'labels', COALESCE((SELECT json_group_array(label) FROM %snode_labels WHERE node_id = %s), json('[]')), "
-        "'properties', %s)",
+        "'labels', json(COALESCE((SELECT json_group_array(label) FROM %snode_labels WHERE node_id = %s), '[]')), "
+        "'properties', json(%s))",
         id_expr, gprefix, id_expr, props);
     free(props);
     return out;
@@ -87,7 +87,7 @@ static inline char *gql_sql_edge_json_expr(const char *gprefix, const char *id_e
     char *props = gql_sql_props_expr("edge", "edge_id", gprefix, id_expr);
     if (!props) return NULL;
     char *out = gql_sql_vasprintf(
-        "json_object('id', %s, 'type', %s, 'startNode', %s, 'endNode', %s, 'properties', %s)",
+        "json_object('id', %s, 'type', %s, 'startNode', %s, 'endNode', %s, 'properties', json(%s))",
         id_expr, type_expr, start_expr, end_expr, props);
     free(props);
     return out;

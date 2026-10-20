@@ -421,6 +421,57 @@ CREATE (:Person {name: row.name, age: toInteger(row.age)})
 
 ---
 
+## CALL subquery
+
+```cypher
+CALL { WITH outerVariable ... }
+CALL (outerVariable, anotherVariable) { ... }
+CALL (*) { ... }
+CALL () { ... }
+```
+
+An explicit scope imports the named outer variables; `*` imports all outer
+variables, and `()` imports none. Imported variables remain visible through
+inner `WITH` clauses. An inner `WITH` cannot reassign an imported name.
+Subquery-local variables reach the outer query only through `RETURN`, and a
+returned name must not collide with an existing outer variable. A subquery
+without `RETURN` preserves its outer row even when it makes no updates.
+
+```cypher
+UNWIND [1, 2] AS value
+CALL (value) {
+  WITH 10 AS offset
+  RETURN value + offset AS result
+}
+RETURN value, result
+```
+
+For template compatibility, a scope may contain `expression AS alias` in
+addition to variable names. These projected imports are a GraphQLite
+extension: expressions are evaluated against the outer row once per
+subquery invocation, and aliases are local to the subquery. Projection
+expressions do not implicitly import their referenced variables.
+
+## Conditional query
+
+```cypher
+WHEN predicate THEN { query_clauses }
+```
+
+The body executes when the predicate is `true`. A `false` or `null`
+predicate skips it. For an update body without `RETURN`, the outer row
+continues to subsequent clauses in either case. Conditions can appear
+inside scoped subqueries, and their bodies can include `UNWIND` and nested
+subqueries. `ELSE` branches are not currently supported.
+
+```cypher
+UNWIND [true, false] AS enabled
+WHEN enabled THEN { CREATE (:Enabled) }
+CREATE (:Processed)
+```
+
+This creates one `Enabled` node and two `Processed` nodes.
+
 ## CALL procedure
 
 **Syntax**

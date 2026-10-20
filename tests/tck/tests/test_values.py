@@ -52,3 +52,12 @@ def test_values_equal_handles_node_identity_irrelevant():
     a = parse_value("(:A {x: 1})")
     b = parse_value("(:A {x: 1})")
     assert values_equal(a, b)
+
+
+def test_malformed_entity_properties_fail_comparison_without_crashing():
+    """Engine encoding errors must be failures, not abort the entire TCK run."""
+    from tests.tck.values import Node, Relationship, values_equal
+    assert not values_equal(Node(labels=('Person',), properties=(('name', 'Alice'),)),
+                            {'id': 1, 'labels': ['Person'], 'properties': '{"name":"Alice"}'})
+    assert not values_equal(Relationship(type='KNOWS', properties=(('since', 2020),)),
+                            {'id': 1, 'type': 'KNOWS', 'properties': '{"since":2020}'})

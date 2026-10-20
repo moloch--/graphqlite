@@ -22,19 +22,6 @@
  * a SELECT … FROM nodes WHERE id=… SQL query and reading the result.
  * Used by SET to handle any RHS shape beyond bare literals/params/funcs
  * (e.g. 'SET n.num = n.num + 1' where the RHS is a BINARY_OP). */
-/* Is text a valid JSON document? A string such as '[draft]' is not. */
-static bool text_is_json(sqlite3 *db, const char *text)
-{
-    sqlite3_stmt *st = NULL;
-    bool ok = false;
-    if (sqlite3_prepare_v2(db, "SELECT json_valid(?)", -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, text, -1, SQLITE_STATIC);
-        ok = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 1;
-        sqlite3_finalize(st);
-    }
-    return ok;
-}
-
 /* Register the current UNWIND/FOREACH values as scalar variables, so an
  * expression such as toString(i) or row.a * 2 can read them (#124).
  * A variable that var_map binds to an entity wins. */
@@ -332,6 +319,14 @@ int evaluate_function_call_via_sqlite(
     }
 
     int col_type = sqlite3_column_type(stmt, 0);
+    unsigned subtype = sqlite3_value_subtype(sqlite3_column_value(stmt, 0));
+    if (subtype == GQL_SUBTYPE_BOOLEAN && col_type != SQLITE_NULL) {
+        const char *value = (const char *)sqlite3_column_text(stmt, 0);
+        *out_type = PROP_TYPE_BOOLEAN;
+        out_value->as_bool = value && (!strcmp(value, "true") || !strcmp(value, "1"));
+        sqlite3_finalize(stmt);
+        return 0;
+    }
     switch (col_type) {
         case SQLITE_INTEGER:
             *out_type = PROP_TYPE_INTEGER;
@@ -343,7 +338,10 @@ int evaluate_function_call_via_sqlite(
             break;
         case SQLITE_TEXT: {
             const char *text = (const char*)sqlite3_column_text(stmt, 0);
-            if (text && (*text == '{' || *text == '[') && text_is_json(executor->db, text)) {
+            /* Functions such as apoc.convert.toJson() and replace() can
+             * return strings that look like JSON. Only an actual JSON
+             * subtype denotes a list or map; content is not a type tag. */
+            if (subtype == GQL_SUBTYPE_JSON) {
                 *out_type = PROP_TYPE_JSON;
             } else {
                 *out_type = PROP_TYPE_TEXT;
@@ -795,6 +793,34 @@ int execute_set_operations(cypher_executor *executor, cypher_set *set, variable_
         if (!item->property) {
             set_result_error(result, "Invalid SET item");
             return -1;
+        }
+
+        /* A dynamic property key is evaluated in the same row/FOREACH scope
+         * as the value, then uses the ordinary typed property assignment. */
+        if (item->property->type == AST_NODE_SUBSCRIPT) {
+            cypher_subscript *sub = (cypher_subscript*)item->property;
+            property_type key_type = PROP_TYPE_TEXT;
+            property_value key; property_value_init(&key);
+            int krc = executor_eval_value(executor, sub->index, var_map, &key_type, &key);
+            if (sub->is_slice || !sub->expr || sub->expr->type != AST_NODE_IDENTIFIER ||
+                krc != 0 || key_type != PROP_TYPE_TEXT || !key.as_str) {
+                property_value_free(&key);
+                set_result_error(result, "TypeError: dynamic SET property key must be a string");
+                return -1;
+            }
+            cypher_property prop = {0};
+            prop.base.type = AST_NODE_PROPERTY;
+            prop.expr = sub->expr;
+            prop.property_name = key.as_str;
+            cypher_set_item resolved = *item;
+            resolved.property = (ast_node*)&prop;
+            ast_node *one[] = {(ast_node*)&resolved};
+            ast_list items = {0}; items.items = one; items.count = 1;
+            cypher_set single = *set; single.items = &items;
+            int rc = execute_set_operations(executor, &single, var_map, result);
+            property_value_free(&key);
+            if (rc < 0) return rc;
+            continue;
         }
 
         /* Handle label assignment (SET n:Label) */

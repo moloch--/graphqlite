@@ -575,13 +575,20 @@ int transform_binary_operation(cypher_transform_context *ctx, cypher_binary_op *
     if ((binary_op->op_type == BINARY_OP_EQ || binary_op->op_type == BINARY_OP_NEQ) &&
         (binary_op->left->type == AST_NODE_LIST || binary_op->left->type == AST_NODE_MAP ||
          binary_op->right->type == AST_NODE_LIST || binary_op->right->type == AST_NODE_MAP)) {
-        if (binary_op->op_type == BINARY_OP_NEQ) append_sql(ctx, "(NOT _gql_eq(");
-        else                                    append_sql(ctx, "_gql_eq(");
-        if (transform_expression(ctx, binary_op->left) < 0) return -1;
-        append_sql(ctx, ", ");
-        if (transform_expression(ctx, binary_op->right) < 0) return -1;
-        append_sql(ctx, ")");
-        if (binary_op->op_type == BINARY_OP_NEQ) append_sql(ctx, ")");
+        char *lv = cypher_transform_capture_expression(ctx, binary_op->left);
+        char *rv = lv ? cypher_transform_capture_expression(ctx, binary_op->right) : NULL;
+        if (!lv || !rv) { free(lv); free(rv); return -1; }
+        char *ltag = cypher_expr_tag_sql(ctx, binary_op->left, lv);
+        char *rtag = cypher_expr_tag_sql(ctx, binary_op->right, rv);
+        /* _gql_eq receives JSON text. An explicitly typed string must not
+         * become a list/map merely because its bytes are valid JSON. Keep
+         * SQL null propagation before rejecting the differing types. */
+        append_sql(ctx, "(CASE WHEN (%s) IS NULL OR (%s) IS NULL THEN NULL "
+                        "WHEN (%s) = 'text' OR (%s) = 'text' THEN %d ELSE %s_gql_eq(%s, %s) END)",
+                   lv, rv, ltag ? ltag : "NULL", rtag ? rtag : "NULL",
+                   binary_op->op_type == BINARY_OP_EQ ? 0 : 1,
+                   binary_op->op_type == BINARY_OP_NEQ ? "NOT " : "", lv, rv);
+        free(lv); free(rv); free(ltag); free(rtag);
         ctx->in_comparison = was_in_comparison;
         return 0;
     }
@@ -1234,6 +1241,13 @@ int transform_property_access(cypher_transform_context *ctx, cypher_property *pr
         return 0;
     }
 
+    /* A scalar subquery may strip SQLite's subtype before the surrounding
+     * expression reads it. Restore the stored type at this boundary so
+     * boolean/list operators and list/map construction see typed values.
+     * Comparisons deliberately use raw numeric booleans; their type guard
+     * captures this same expression in value mode. */
+    bool retag_value = !ctx->in_comparison;
+    if (retag_value) append_sql(ctx, "_gql_retag(");
     append_sql(ctx, "(SELECT COALESCE(");
     if (is_edge) {
         const char *bool_expr = ctx->in_comparison ? "CAST(epb.value AS INTEGER)" : "_gql_bool_str(epb.value)";
@@ -1267,6 +1281,12 @@ int transform_property_access(cypher_transform_context *ctx, cypher_property *pr
                            ctx->in_comparison ? "npj.value" : "json(npj.value)", key, key_id);
     }
     append_sql(ctx, "))");
+    if (retag_value) {
+        char *tag = transform_property_tag_sql(ctx, prop);
+        if (!tag) return -1;
+        append_sql(ctx, ", %s)", tag);
+        free(tag);
+    }
 
     return 0;
 }

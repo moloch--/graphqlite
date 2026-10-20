@@ -158,16 +158,16 @@ static char *keyword_text_at(cypher_parser_context *context, int line, int col,
 %type <delete> delete_clause
 %type <remove> remove_clause
 %type <with_clause> with_clause
-%type <node> unwind_clause foreach_clause call_clause load_csv_clause list_literal list_comprehension pattern_comprehension map_literal map_projection map_projection_item case_expression when_clause
+%type <node> unwind_clause foreach_clause call_clause conditional_clause load_csv_clause list_literal list_comprehension pattern_comprehension map_literal map_projection map_projection_item case_expression when_clause
 %type <list> map_projection_list foreach_update_list
 %type <list> when_clause_list on_create_clause on_match_clause
 
 %type <list> pattern_list return_item_list set_item_list delete_item_list remove_item_list
 %type <set_item> set_item
 %type <delete_item> delete_item
-%type <string> procedure_name
-%type <list> proc_args_opt yield_item_list
-%type <return_item> yield_item
+%type <string> procedure_name qualified_function_name
+%type <list> proc_args_opt yield_item_list call_import_list
+%type <return_item> yield_item call_import_item
 %type <remove_item> remove_item
 %type <boolean> detach_opt
 %type <path> path simple_path
@@ -294,6 +294,7 @@ clause:
     | delete_clause     { $$ = (ast_node*)$1; }
     | remove_clause     { $$ = (ast_node*)$1; }
     | call_clause       { $$ = $1; }
+    | conditional_clause { $$ = $1; }
     ;
 
 /* MATCH clause */
@@ -389,6 +390,45 @@ call_clause:
             ast_list_append(branches, $3);
             $$ = (ast_node*)make_cypher_call_subquery(branches, @1.first_line);
         }
+    | CALL '(' call_import_list ')' '{' union_query '}'
+        {
+            ast_list *branches = ast_list_create();
+            ast_list_append(branches, $6);
+            cypher_call_subquery *call = make_cypher_call_subquery(branches, @1.first_line);
+            call->explicit_scope = true;
+            call->imports = ast_list_create();
+            call->import_projections = ast_list_create();
+            for (int i = 0; i < $3->count; i++) {
+                cypher_return_item *item = (cypher_return_item*)$3->items[i];
+                if (item->alias) {
+                    ast_list_append(call->import_projections, (ast_node*)item);
+                } else {
+                    ast_list_append(call->imports, item->expr);
+                    item->expr = NULL;
+                    ast_node_free((ast_node*)item);
+                }
+                $3->items[i] = NULL;
+            }
+            ast_list_free($3);
+            $$ = (ast_node*)call;
+        }
+    | CALL '(' '*' ')' '{' union_query '}'
+        {
+            ast_list *branches = ast_list_create();
+            ast_list_append(branches, $6);
+            cypher_call_subquery *call = make_cypher_call_subquery(branches, @1.first_line);
+            call->explicit_scope = true;
+            call->import_all = true;
+            $$ = (ast_node*)call;
+        }
+    | CALL '(' ')' '{' union_query '}'
+        {
+            ast_list *branches = ast_list_create();
+            ast_list_append(branches, $5);
+            cypher_call_subquery *call = make_cypher_call_subquery(branches, @1.first_line);
+            call->explicit_scope = true;
+            $$ = (ast_node*)call;
+        }
     | CALL procedure_name proc_args_opt
         {
             /* `CALL pageRank()`: the graph algorithms are procedures; any
@@ -410,6 +450,58 @@ call_clause:
         {
             $$ = (ast_node*)make_cypher_call_procedure($2, $3, $5, false, $7, @1.first_line);
             free($2);
+        }
+    ;
+
+call_import_list:
+    call_import_item
+        {
+            $$ = ast_list_create();
+            ast_list_append($$, (ast_node*)$1);
+        }
+    | call_import_list ',' call_import_item
+        {
+            ast_list_append($1, (ast_node*)$3);
+            $$ = $1;
+        }
+    ;
+
+call_import_item:
+    identifier
+        { $$ = make_return_item((ast_node*)$1, NULL); }
+    | expr AS IDENTIFIER
+        {
+            /* Cirro compatibility extension: evaluate a projected import
+             * in the outer row, then make its alias local to the subquery. */
+            $$ = make_return_item($1, $3);
+            free($3);
+        }
+    | expr AS BQIDENT
+        {
+            $$ = make_return_item($1, $3);
+            free($3);
+        }
+    ;
+
+/* A conditional update query is a unit subquery whose first projection
+ * filters its input row. Keeping it a CALL preserves the outer row when
+ * the condition is false/null, including between independent branches. */
+conditional_clause:
+    WHEN expr THEN '{' clause_list '}'
+        {
+            ast_list *body = ast_list_create();
+            ast_list_append(body, (ast_node*)make_cypher_with(false, NULL, NULL, NULL, NULL, $2));
+            for (int i = 0; i < $5->count; i++) {
+                ast_list_append(body, $5->items[i]);
+                $5->items[i] = NULL;
+            }
+            ast_list_free($5);
+            ast_list *branches = ast_list_create();
+            ast_list_append(branches, (ast_node*)make_cypher_query(body, false));
+            cypher_call_subquery *call = make_cypher_call_subquery(branches, @1.first_line);
+            call->explicit_scope = true;
+            call->import_all = true;
+            $$ = (ast_node*)call;
         }
     ;
 
@@ -449,7 +541,7 @@ yield_item:
 procedure_name:
     IDENTIFIER
         { $$ = $1; }
-    | procedure_name '.' IDENTIFIER
+    | procedure_name '.' label_name
         {
             size_t n = strlen($1) + strlen($3) + 2;
             $$ = malloc(n);
@@ -705,6 +797,10 @@ set_target:
         {
             $$ = (ast_node*)make_property($1, $3, @3.first_line);
             free($3);
+        }
+    | set_target '[' expr ']'
+        {
+            $$ = (ast_node*)make_subscript($1, $3, @2.first_line);
         }
     ;
 
@@ -1608,30 +1704,39 @@ literal_expr:
     literal             { $$ = (ast_node*)$1; }
     ;
 
+qualified_function_name:
+    IDENTIFIER '.' label_name
+        {
+            size_t len = strlen($1) + strlen($3) + 2;
+            $$ = malloc(len);
+            if ($$) snprintf($$, len, "%s.%s", $1, $3);
+            free($1);
+            free($3);
+        }
+    | qualified_function_name '.' label_name
+        {
+            size_t len = strlen($1) + strlen($3) + 2;
+            $$ = malloc(len);
+            if ($$) snprintf($$, len, "%s.%s", $1, $3);
+            free($1);
+            free($3);
+        }
+    ;
+
 function_call:
     /* Qualified function names (e.g. `date.truncate(...)`, `datetime.fromEpoch(...)`)
      * are concatenated into a single function name so the dispatch table
      * can look them up. */
-    IDENTIFIER '.' IDENTIFIER '(' argument_list ')'
+    qualified_function_name '(' argument_list ')'
         {
-            size_t len = strlen($1) + 1 + strlen($3) + 1;
-            char *qname = malloc(len);
-            if (qname) snprintf(qname, len, "%s.%s", $1, $3);
-            $$ = (ast_node*)make_function_call(qname ? qname : $1, $5, false, @1.first_line);
+            $$ = (ast_node*)make_function_call($1, $3, false, @1.first_line);
             free($1);
-            free($3);
-            if (qname) free(qname);
         }
-    | IDENTIFIER '.' IDENTIFIER '(' ')'
+    | qualified_function_name '(' ')'
         {
-            size_t len = strlen($1) + 1 + strlen($3) + 1;
-            char *qname = malloc(len);
-            if (qname) snprintf(qname, len, "%s.%s", $1, $3);
             ast_list *args = ast_list_create();
-            $$ = (ast_node*)make_function_call(qname ? qname : $1, args, false, @1.first_line);
+            $$ = (ast_node*)make_function_call($1, args, false, @1.first_line);
             free($1);
-            free($3);
-            if (qname) free(qname);
         }
     | IDENTIFIER '(' ')'
         {
@@ -1919,6 +2024,11 @@ map_literal:
         }
     | '{' map_pair_list '}'
         {
+            $$ = (ast_node*)make_map($2, @1.first_line);
+        }
+    | '{' map_pair_list ',' '}'
+        {
+            /* A single trailing comma is accepted for template compatibility. */
             $$ = (ast_node*)make_map($2, @1.first_line);
         }
     ;

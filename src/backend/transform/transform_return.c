@@ -280,7 +280,8 @@ char *cypher_expr_tag_sql(cypher_transform_context *ctx, ast_node *expr, const c
                 static const char *const string_fns[] = {
                     "toString", "toStringOrNull", "substring", "left", "right",
                     "trim", "ltrim", "rtrim", "btrim", "toUpper", "toLower",
-                    "upper", "lower", "replace", "type", "valueType", NULL
+                    "upper", "lower", "replace", "type", "valueType",
+                    "apoc.convert.toJson", "apoc.text.replace", NULL
                 };
                 for (int k = 0; string_fns[k]; k++) {
                     if (!strcasecmp(n, string_fns[k])) {
@@ -341,51 +342,14 @@ char *cypher_expr_tag_sql(cypher_transform_context *ctx, ast_node *expr, const c
     return out;
 }
 
-/* GQLITE-A-0007: the tag of a RETURN item goes in a hidden column
- * __gqlt_<i> after the visible columns, as plain text that survives the
- * sorter of ORDER BY / DISTINCT / GROUP BY, which drops subtypes. The
- * result reader applies it. */
-static bool expr_has_aggregate(const ast_node *expr)
-{
-    if (!expr) return false;
-    if (expr->type == AST_NODE_FUNCTION_CALL) {
-        const cypher_function_call *fc = (const cypher_function_call *)expr;
-        const char *n = fc->function_name;
-        if (n && (!strcasecmp(n, "count") || !strcasecmp(n, "sum") || !strcasecmp(n, "avg") ||
-                  !strcasecmp(n, "min") || !strcasecmp(n, "max") || !strcasecmp(n, "collect") ||
-                  !strncasecmp(n, "stDev", 5) || !strncasecmp(n, "percentile", 10)))
-            return true;
-        for (int i = 0; fc->args && i < fc->args->count; i++)
-            if (expr_has_aggregate(fc->args->items[i])) return true;
-        return false;
-    }
-    if (expr->type == AST_NODE_BINARY_OP) {
-        const cypher_binary_op *b = (const cypher_binary_op *)expr;
-        return expr_has_aggregate(b->left) || expr_has_aggregate(b->right);
-    }
-    return false;
-}
-
-/* Does the RETURN pass its rows through SQLite's sorter (ORDER BY,
- * DISTINCT, grouping, UNION), which drops subtypes? */
-static bool return_uses_sorter(cypher_transform_context *ctx, cypher_return *ret)
-{
-    if (ret->distinct || ctx->in_union) return true;
-    if (ret->order_by && ret->order_by->count > 0) return true;
-    for (int i = 0; ret->items && i < ret->items->count; i++) {
-        cypher_return_item *it = (cypher_return_item *)ret->items->items[i];
-        if (it && expr_has_aggregate(it->expr)) return true;
-    }
-    return false;
-}
-
 static char *return_item_tag_sql(cypher_transform_context *ctx, cypher_return *ret,
                                  ast_node *expr, const char *expr_sql)
 {
-    /* A property read keeps its subtype to the reader when no sorter is in
-     * the way, and the reader takes its TEXT as a string: the tag (two key
-     * probes per row) is needed only with a sorter. */
-    if (expr && expr->type == AST_NODE_PROPERTY && !return_uses_sorter(ctx, ret)) return NULL;
+    (void)ret;
+    /* Type tags must also accompany unsorted property reads: SQLite can
+     * drop a JSON/boolean subtype at a scalar-subquery boundary, before
+     * the result reader sees it. Looking at the stored property type keeps
+     * arrays/booleans distinct from strings that happen to resemble JSON. */
     return cypher_expr_tag_sql(ctx, expr, expr_sql);
 }
 

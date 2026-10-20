@@ -393,7 +393,7 @@ fn load_extension(conn: &rusqlite::Connection, path: &std::path::Path) -> Result
 
     unsafe {
         conn.load_extension_enable()?;
-        conn.load_extension(&load_path, None)?;
+        conn.load_extension(&load_path, None::<&str>)?;
         conn.load_extension_disable()?;
     }
 

@@ -389,6 +389,17 @@ def _pick_python_with_extension_support(verbose: bool = False) -> str | None:
 
 
 @test()
+@angreal.command(name="tck-harness", about="Test the TCK parser and result comparison harness")
+def test_tck_harness() -> int:
+    """Keep harness checks separate from the binding package's tests namespace."""
+    python = _pick_python_with_extension_support()
+    if python is None or not ensure_extension_built():
+        return 1
+    return subprocess.run([python, "-m", "pytest", "tests/tck/tests", "-q"],
+                          cwd=get_project_root()).returncode
+
+
+@test()
 @angreal.command(
     name="constraints",
     about="Run constraint tests (expected failures)",

@@ -16,6 +16,7 @@
 #include "graphqlite_sqlite.h"
 #include "runtime/udf_register.h"
 #include "runtime/udf_helpers.h"
+#include "runtime/apoc_helpers.h"
 #include "executor/graph_algorithms.h"
 
 /* _gql_label_propagation(iterations): the C label propagation as JSON
@@ -200,6 +201,12 @@ __declspec(dllexport)
 int graphqlite_register_helper_udfs(sqlite3 *db)
 {
   int rc;
+  rc = sqlite3_create_function(db, "_gql_apoc_to_json", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_SUBTYPE, 0, gql_apoc_to_json, 0, 0);
+  if (rc != SQLITE_OK) return rc;
+  rc = sqlite3_create_function(db, "_gql_apoc_text_replace", 3, SQLITE_UTF8 | SQLITE_DETERMINISTIC, 0, gql_apoc_text_replace, 0, 0);
+  if (rc != SQLITE_OK) return rc;
+  rc = sqlite3_create_function(db, "_gql_apoc_text_indexof", -1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, 0, gql_apoc_text_indexof, 0, 0);
+  if (rc != SQLITE_OK) return rc;
 
   rc = sqlite3_create_function(db, "regexp", 2, SQLITE_UTF8, 0,
                          regexp_func, 0, 0);

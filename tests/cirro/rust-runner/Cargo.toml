@@ -1,0 +1,11 @@
+[package]
+name = "cirro-compat-runner"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+graphqlite = { path = "../../../bindings/rust", default-features = false }
+# Cirro v1.3.0 uses rusqlite 0.37, whose bundled SQLite is 3.50.2.
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+serde_json = "1.0"

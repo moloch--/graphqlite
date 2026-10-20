@@ -358,7 +358,9 @@ int transform_keys_function(cypher_transform_context *ctx, cypher_function_call 
         append_sql(ctx,
             "(SELECT CASE WHEN _kv.v IS NULL THEN NULL ELSE "
             "(SELECT json_group_array(key) FROM json_each("
-            "CASE WHEN json_type(_kv.v, '$.properties') = 'object' "
+            "CASE WHEN json_type(_kv.v, '$.id') = 'integer' AND json_type(_kv.v, '$.properties') = 'object' "
+            "AND (json_type(_kv.v, '$.labels') = 'array' OR (json_type(_kv.v, '$.type') = 'text' "
+            "AND json_type(_kv.v, '$.startNode') = 'integer' AND json_type(_kv.v, '$.endNode') = 'integer')) "
             "THEN json_extract(_kv.v, '$.properties') ELSE _kv.v END)) END "
             "FROM (SELECT ");
         if (transform_expression(ctx, arg) < 0) return -1;

@@ -161,12 +161,17 @@ static int emit_registered_path_members(cypher_transform_context *ctx, transform
     char *ej = want_nodes ? gql_sql_node_json_expr("", "_pm.v")
                           : gql_sql_edge_json_expr("", "e.id", "e.type", "e.source_id", "e.target_id");
     if (!ej) { dbuf_free(&u); return -1; }
+    /* Reapply the JSON subtype outside both the scalar subquery and CASE.
+     * SQLite may drop it at either boundary; collect(nodes(p)) must contain
+     * arrays of nodes, not strings containing their JSON representation. */
+    append_sql(ctx, "json(");
     /* A null path (OPTIONAL pattern that did not match) gives null. */
     if (null_guard[0]) append_sql(ctx, "(CASE WHEN %s THEN NULL ELSE ", null_guard);
     append_sql(ctx,
         "(SELECT json_group_array(json(%s) ORDER BY _pm.seg, _pm.k) FROM (%s) _pm%s)",
         ej, dbuf_get(&u), want_nodes ? "" : " JOIN edges e ON e.id = _pm.v");
     if (null_guard[0]) append_sql(ctx, " END)");
+    append_sql(ctx, ")");
     free(ej);
     dbuf_free(&u);
     return 0;
@@ -188,7 +193,7 @@ static int emit_json_path_members(cypher_transform_context *ctx, ast_node *arg, 
                           : gql_sql_edge_json_expr("", "e.id", "e.type", "e.source_id", "e.target_id");
     if (!ej) { free(v); return -1; }
     append_sql(ctx,
-        "(CASE WHEN %s IS NULL THEN NULL"
+        "json(CASE WHEN %s IS NULL THEN NULL"
         " WHEN json_valid(%s) AND json_type(%s) = 'object' THEN json_extract(%s, '$.%s')"
         " ELSE (SELECT json_group_array(json(%s) ORDER BY je.key) FROM json_each(%s) je%s"
         " WHERE (je.key %% 2) = %d) END)",

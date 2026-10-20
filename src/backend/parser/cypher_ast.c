@@ -174,6 +174,14 @@ void ast_node_free(ast_node *node)
                     ast_list_free(call->branches);
                     call->branches = NULL;
                 }
+                if (call->imports) {
+                    ast_list_free(call->imports);
+                    call->imports = NULL;
+                }
+                if (call->import_projections) {
+                    ast_list_free(call->import_projections);
+                    call->import_projections = NULL;
+                }
             }
             break;
 

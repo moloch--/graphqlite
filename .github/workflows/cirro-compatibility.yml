@@ -1,0 +1,72 @@
+name: Cirro compatibility
+
+on:
+  push:
+    branches: [main, feat/cirro-compatibility]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: BishopFox/cirro
+          ref: cb298b7751a5c1e9afe9b413c6ac21c8a7c3c808
+          path: build/cirro-source
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bison flex sqlite3 libsqlite3-dev libcunit1-dev
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install bison flex sqlite cunit
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
+      - name: Install test tools
+        run: python -m pip install angreal==2.9.2 PyYAML pytest
+      - name: Build extension
+        run: angreal build extension --release
+      - name: Run upstream regression suites
+        run: |
+          angreal test unit
+          angreal test functional
+          GQLITE_TCK_PYTHON="$(command -v python)" angreal test tck-harness
+          GQLITE_TCK_PYTHON="$(command -v python)" angreal test tck
+          scripts/check-tck-baseline.sh
+      - name: Run Rust binding tests
+        run: angreal test rust
+      - name: Build Cirro Rust adapter
+        run: cargo build --locked --manifest-path tests/cirro/rust-runner/Cargo.toml --target-dir build/cirro-rust
+      - name: Check unchanged Cirro queries and graph results
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then ext=dylib; else ext=so; fi
+          python tests/cirro/check.py --cirro-root build/cirro-source --extension "build/graphqlite.$ext" --output build/cirro-extension.json
+          python tests/cirro/check.py --cirro-root build/cirro-source --extension "build/graphqlite.$ext" --rust-runner build/cirro-rust/debug/cirro-compat-runner --output build/cirro-rust.json
+          python tests/cirro/apoc_failures.py --extension "build/graphqlite.$ext"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cirro-compatibility-${{ matrix.os }}
+          path: |
+            build/cirro-extension.json
+            build/cirro-rust.json
+            build/tck-results.json

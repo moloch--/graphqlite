@@ -320,7 +320,8 @@ static char *transform_expression_to_string(cypher_transform_context *ctx, ast_n
     }
 
     /* Restore original buffer */
-    free(temp_buffer);
+    /* append_sql may grow and relocate the temporary buffer. */
+    free(ctx->sql_buffer);
     ctx->sql_buffer = saved_buffer;
     ctx->sql_size = saved_size;
     ctx->sql_capacity = saved_capacity;

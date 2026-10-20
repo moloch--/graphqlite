@@ -24,7 +24,8 @@ GraphQLite implements a substantial subset of openCypher. This page is a quick-r
 | `UNION` / `UNION ALL` | Supported | |
 | `LOAD CSV [WITH HEADERS] FROM` | Supported | Local files, `FIELDTERMINATOR`, `linenumber()`, `file()` |
 | `FROM` | Supported | Multi-graph queries (GraphQLite extension) |
-| `CALL {}` subqueries | Supported | Importing `WITH`, writes in the body |
+| `CALL {}` subqueries | Supported | Importing `WITH`, explicit `CALL (x, y)` / `CALL (*)` / `CALL ()` scopes, writes in the body |
+| `WHEN predicate THEN { ... }` | Supported | Conditional query body; false/null skips the body without dropping the outer row |
 | `CALL procedure` | Supported | Graph algorithms: `CALL pageRank() YIELD node, score` |
 | `CREATE` / `DROP` / `SHOW INDEX` | Supported | A record only: each property is indexed already |
 | `CREATE` / `DROP` / `SHOW CONSTRAINT` | Supported | Node `IS UNIQUE` and `IS NOT NULL` |
@@ -62,6 +63,14 @@ GraphQLite implements a substantial subset of openCypher. This page is a quick-r
 | List | `IN`, `+` (concat), `[index]`, `[start..end]` (slice) |
 | Null | `IS NULL`, `IS NOT NULL` |
 | Property access | `.` (dot notation), `['key']` (subscript) |
+
+### Template compatibility extensions
+
+Scoped subqueries also accept projected imports, such as
+`CALL (row, toLower(row.id) AS normalizedId) { ... }`. Each projection is
+evaluated against the outer row, and its alias is visible only inside the
+subquery. This is a GraphQLite extension to the variable-only scope clause.
+Map literals accept a single trailing comma (`{name: "example",}`).
 
 ## Not Supported
 

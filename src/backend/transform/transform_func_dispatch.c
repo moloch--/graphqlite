@@ -42,7 +42,29 @@ static int transform_csv_context_function(cypher_transform_context *ctx, cypher_
     return rc;
 }
 
+/* APOC expression aliases intentionally limited to the documented subset. */
+static int transform_apoc_function(cypher_transform_context *ctx, cypher_function_call *fc)
+{
+    const char *sql = NULL;
+    int min = 0, max = 0;
+    if (!strcasecmp(fc->function_name, "apoc.convert.toJson")) { sql = "_gql_apoc_to_json"; min=max=1; }
+    else if (!strcasecmp(fc->function_name, "apoc.text.replace")) { sql="_gql_apoc_text_replace"; min=max=3; }
+    else { sql="_gql_apoc_text_indexof"; min=2; max=4; }
+    int n=fc->args ? fc->args->count : 0;
+    if (n<min || n>max) { ctx->has_error=true; ctx->error_message=strdup("Invalid APOC function argument count"); return -1; }
+    append_sql(ctx,sql); append_sql(ctx,"(");
+    for (int i=0;i<n;i++) {
+        if (i) append_sql(ctx,",");
+        if (transform_expression(ctx,fc->args->items[i])<0) return -1;
+    }
+    append_sql(ctx,")");
+    return 0;
+}
+
 static const transform_func_entry dispatch_table[] = {
+    {"apoc.convert.toJson", transform_apoc_function},
+    {"apoc.text.replace", transform_apoc_function},
+    {"apoc.text.indexOf", transform_apoc_function},
     /* LOAD CSV context */
     {"linenumber",      transform_csv_context_function},
     {"file",            transform_csv_context_function},

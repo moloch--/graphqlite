@@ -820,7 +820,10 @@ void gql_dyn_prop_func(sqlite3_context *context, int argc, sqlite3_value **argv)
     for (int i = 0; k && meta[i]; i++) if (strcmp(k, meta[i]) == 0) is_meta = true;
     sqlite3_value *obj = argv[0];
     sqlite3_value *props = NULL;
-    if (!is_meta && sqlite3_prepare_v2(db, "SELECT json_extract(?1, '$.properties')", -1, &st, NULL) == SQLITE_OK) {
+    if (!is_meta && sqlite3_prepare_v2(db, "SELECT json_extract(?1, '$.properties') WHERE json_type(?1, '$.id') = 'integer' "
+            "AND json_type(?1, '$.properties') = 'object' AND (json_type(?1, '$.labels') = 'array' "
+            "OR (json_type(?1, '$.type') = 'text' AND json_type(?1, '$.startNode') = 'integer' "
+            "AND json_type(?1, '$.endNode') = 'integer'))", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_value(st, 1, argv[0]);
         if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL)
             props = sqlite3_value_dup(sqlite3_column_value(st, 0));
@@ -4446,7 +4449,18 @@ static const gql_capability_flag gql_capability_flags[] = {
     {"merge_on_create_on_match",      1},
     {"union",                         1},
     {"call_subquery",                 1},  /* CALL { ... } */
-    {"call_procedures",               1},  /* CALL algorithm(...) YIELD ...; other names: ProcedureNotFound */
+    {"call_subquery_scoped",          1},  /* CALL (x), CALL (*), CALL () */
+    {"call_import_projections",       1},  /* CALL (expression AS name) */
+    {"conditional_when",              1},  /* WHEN predicate THEN { unit clauses } */
+    {"dynamic_property_set",          1},  /* SET entity[key] = value */
+    {"call_procedures",               1},  /* Algorithms and the named APOC subset below */
+    {"apoc_convert_tojson",           1},
+    {"apoc_text_replace_posix_regex", 1},
+    {"apoc_text_indexof",             1},
+    {"apoc_refactor_mergenodes_subset", 1}, /* properties, mergeRels options */
+    {"apoc_refactor_mergerelationships_subset", 1}, /* properties option */
+    {"apoc_merge_relationship",       1},
+    {"apoc_periodic_iterate_sequential_atomic", 1}, /* params, batchSize, parallel */
     {"existential_subquery_pattern",  1},  /* EXISTS((p)), EXISTS { (p) WHERE ... } */
     {"existential_subquery_full",     1},  /* EXISTS { MATCH ... RETURN ... } */
     {"pattern_comprehension",         1},

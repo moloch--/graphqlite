@@ -169,6 +169,7 @@ EXECUTOR_SRCS = \
 	$(EXECUTOR_DIR)/executor_call_subquery.c \
 	$(EXECUTOR_DIR)/executor_merge_pipeline.c \
 	$(EXECUTOR_DIR)/executor_schema_objects.c \
+	$(EXECUTOR_DIR)/executor_apoc.c \
 	$(EXECUTOR_DIR)/executor_result_project.c \
 	$(EXECUTOR_DIR)/agtype.c \
 	$(EXECUTOR_DIR)/json_builder.c \
@@ -201,6 +202,7 @@ EXECUTOR_OBJS_PIC = $(EXECUTOR_SRCS:$(EXECUTOR_DIR)/%.c=$(BUILD_EXECUTOR_DIR)/%.
 RUNTIME_DIR = $(SRC_DIR)/backend/runtime
 RUNTIME_SRCS = \
 	$(RUNTIME_DIR)/udf_helpers.c \
+	$(RUNTIME_DIR)/apoc_helpers.c \
 	$(RUNTIME_DIR)/udf_register.c \
 	$(RUNTIME_DIR)/cypher_rows_vtab.c \
 	$(RUNTIME_DIR)/gql_tz.c \

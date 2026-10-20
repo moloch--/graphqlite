@@ -2399,12 +2399,158 @@ int transform_validate_union(cypher_union *u, char **error_message)
                                     &first_items, error_message);
 }
 
-int transform_validate_query(cypher_query *query, char **error_message)
+/* Scoped CALL expressions must not accidentally see variables from the
+ * enclosing query. Unlike the historical write-only undefined-name check,
+ * this walk includes containers and their locally-bound loop variables. */
+static int check_scoped_expr(ast_node *expr, const name_set *bound,
+                             char **error_message)
+{
+    if (!expr) return 0;
+#define CHECK_SCOPE(e) do { if (check_scoped_expr((e), bound, error_message) < 0) return -1; } while (0)
+    switch (expr->type) {
+        case AST_NODE_IDENTIFIER:
+            return check_undef_in_expr(expr, bound, "CALL", error_message);
+        case AST_NODE_PROPERTY: CHECK_SCOPE(((cypher_property*)expr)->expr); break;
+        case AST_NODE_LABEL_EXPR: CHECK_SCOPE(((cypher_label_expr*)expr)->expr); break;
+        case AST_NODE_NOT_EXPR: CHECK_SCOPE(((cypher_not_expr*)expr)->expr); break;
+        case AST_NODE_NULL_CHECK: CHECK_SCOPE(((cypher_null_check*)expr)->expr); break;
+        case AST_NODE_BINARY_OP: {
+            cypher_binary_op *b = (cypher_binary_op*)expr;
+            CHECK_SCOPE(b->left); CHECK_SCOPE(b->right); break;
+        }
+        case AST_NODE_SUBSCRIPT: {
+            cypher_subscript *s = (cypher_subscript*)expr;
+            CHECK_SCOPE(s->expr); CHECK_SCOPE(s->index);
+            CHECK_SCOPE(s->slice_start); CHECK_SCOPE(s->slice_end); break;
+        }
+        case AST_NODE_FUNCTION_CALL:
+        case AST_NODE_LIST:
+        case AST_NODE_MAP: {
+            ast_list *items = expr->type == AST_NODE_FUNCTION_CALL ? ((cypher_function_call*)expr)->args :
+                              expr->type == AST_NODE_LIST ? ((cypher_list*)expr)->items : ((cypher_map*)expr)->pairs;
+            for (int i = 0; items && i < items->count; i++) CHECK_SCOPE(items->items[i]);
+            break;
+        }
+        case AST_NODE_MAP_PAIR: CHECK_SCOPE(((cypher_map_pair*)expr)->value); break;
+        case AST_NODE_MAP_PROJECTION: {
+            cypher_map_projection *p = (cypher_map_projection*)expr;
+            CHECK_SCOPE(p->base_expr);
+            for (int i = 0; p->items && i < p->items->count; i++)
+                CHECK_SCOPE(((cypher_map_projection_item*)p->items->items[i])->expr);
+            break;
+        }
+        case AST_NODE_CASE_EXPR: {
+            cypher_case_expr *c = (cypher_case_expr*)expr;
+            CHECK_SCOPE(c->operand); CHECK_SCOPE(c->else_expr);
+            for (int i = 0; c->when_clauses && i < c->when_clauses->count; i++) {
+                cypher_when_clause *w = (cypher_when_clause*)c->when_clauses->items[i];
+                CHECK_SCOPE(w->condition); CHECK_SCOPE(w->result);
+            }
+            break;
+        }
+        case AST_NODE_LIST_COMPREHENSION:
+        case AST_NODE_LIST_PREDICATE:
+        case AST_NODE_REDUCE_EXPR: {
+            ast_node *list = NULL, *body = NULL, *filter = NULL;
+            const char *var = NULL, *acc = NULL;
+            if (expr->type == AST_NODE_LIST_COMPREHENSION) {
+                cypher_list_comprehension *c = (cypher_list_comprehension*)expr;
+                list = c->list_expr; body = c->transform_expr; filter = c->where_expr; var = c->variable;
+            } else if (expr->type == AST_NODE_LIST_PREDICATE) {
+                cypher_list_predicate *p = (cypher_list_predicate*)expr;
+                list = p->list_expr; filter = p->predicate; var = p->variable;
+            } else {
+                cypher_reduce_expr *r = (cypher_reduce_expr*)expr;
+                CHECK_SCOPE(r->initial_value);
+                list = r->list_expr; body = r->expression; var = r->variable; acc = r->accumulator;
+            }
+            CHECK_SCOPE(list);
+            name_set local; nset_init(&local);
+            for (int i = 0; i < bound->count; i++) nset_add(&local, bound->names[i]);
+            nset_add(&local, var); nset_add(&local, acc);
+            int rc = check_scoped_expr(filter, &local, error_message);
+            if (rc == 0) rc = check_scoped_expr(body, &local, error_message);
+            nset_free(&local);
+            return rc;
+        }
+        default: break;
+    }
+#undef CHECK_SCOPE
+    return 0;
+}
+
+static int validate_query_scoped(cypher_query *query, char **error_message,
+                                 const name_set *initial, const name_set *persistent,
+                                 const var_type_ctx *outer_types, name_set *exports);
+
+static int validate_scoped_branch(ast_node *branch, const name_set *imports,
+                                  const var_type_ctx *types, name_set *exports,
+                                  char **error_message)
+{
+    if (!branch) return 0;
+    if (branch->type == AST_NODE_UNION) {
+        cypher_union *u = (cypher_union*)branch;
+        if (transform_validate_union(u, error_message) < 0) return -1;
+        if (validate_scoped_branch(u->left, imports, types, exports, error_message) < 0) return -1;
+        return validate_scoped_branch(u->right, imports, types, exports, error_message);
+    }
+    return validate_query_scoped((cypher_query*)branch, error_message, imports, imports, types, exports);
+}
+
+static int validate_scoped_call(cypher_call_subquery *call, name_set *bound,
+                                var_type_ctx *types, char **error_message)
+{
+    name_set imports, exports;
+    nset_init(&imports); nset_init(&exports);
+    int rc = 0;
+    if (call->import_all)
+        for (int i = 0; i < bound->count; i++) nset_add(&imports, bound->names[i]);
+    for (int i = 0; call->imports && i < call->imports->count; i++) {
+        cypher_identifier *id = (cypher_identifier*)call->imports->items[i];
+        if (check_scoped_expr((ast_node*)id, bound, error_message) < 0) { rc = -1; goto done; }
+        if (nset_contains(&imports, id->name)) {
+            set_error(error_message, "SyntaxError: VariableAlreadyBound: duplicate CALL import `%s`", id->name);
+            rc = -1; goto done;
+        }
+        nset_add(&imports, id->name);
+    }
+    for (int i = 0; call->import_projections && i < call->import_projections->count; i++) {
+        cypher_return_item *item = (cypher_return_item*)call->import_projections->items[i];
+        if (check_scoped_expr(item->expr, bound, error_message) < 0) { rc = -1; goto done; }
+        if (nset_contains(&imports, item->alias)) {
+            set_error(error_message, "SyntaxError: VariableAlreadyBound: duplicate CALL import `%s`", item->alias);
+            rc = -1; goto done;
+        }
+        nset_add(&imports, item->alias);
+    }
+    for (int i = 0; call->branches && i < call->branches->count; i++) {
+        rc = validate_scoped_branch(call->branches->items[i], &imports, types, &exports, error_message);
+        if (rc < 0) goto done;
+    }
+    for (int i = 0; i < exports.count; i++) {
+        if (nset_contains(bound, exports.names[i])) {
+            set_error(error_message, "SyntaxError: VariableAlreadyBound: CALL output `%s` is already bound", exports.names[i]);
+            rc = -1; goto done;
+        }
+    }
+    for (int i = 0; i < exports.count; i++) nset_add(bound, exports.names[i]);
+done:
+    nset_free(&imports); nset_free(&exports);
+    return rc;
+}
+
+static int validate_query_scoped(cypher_query *query, char **error_message,
+                                 const name_set *initial, const name_set *persistent,
+                                 const var_type_ctx *outer_types, name_set *exports)
 {
     if (!query || !query->clauses) return 0;
     var_type_ctx vctx;
     vctx_init(&vctx);
     name_set bound; nset_init(&bound);
+    for (int i = 0; initial && i < initial->count; i++) {
+        nset_add(&bound, initial->names[i]);
+        if (outer_types) vctx_register(&vctx, initial->names[i], vctx_lookup(outer_types, initial->names[i]));
+    }
     int rc = 0;
     for (int i = 0; i < query->clauses->count; i++) {
         ast_node *clause = query->clauses->items[i];
@@ -2412,6 +2558,12 @@ int transform_validate_query(cypher_query *query, char **error_message)
         switch (clause->type) {
             case AST_NODE_RETURN: {
                 cypher_return *r = (cypher_return *)clause;
+                for (int ri = 0; initial && r->items && ri < r->items->count; ri++) {
+                    cypher_return_item *it = (cypher_return_item*)r->items->items[ri];
+                    rc = check_scoped_expr(it->expr, &bound, error_message);
+                    if (rc < 0) break;
+                }
+                if (rc < 0) break;
                 /* RETURN * requires at least one variable in scope. */
                 if (r->return_all && bound.count == 0) {
                     set_error(error_message,
@@ -2420,10 +2572,36 @@ int transform_validate_query(cypher_query *query, char **error_message)
                     break;
                 }
                 rc = validate_return_clause(r, &vctx, error_message);
+                if (rc == 0 && exports) {
+                    if (r->return_all) {
+                        for (int ei = 0; ei < bound.count; ei++) nset_add(exports, bound.names[ei]);
+                    } else for (int ri = 0; r->items && ri < r->items->count; ri++) {
+                        cypher_return_item *it = (cypher_return_item*)r->items->items[ri];
+                        if (it->alias) nset_add(exports, it->alias);
+                        else if (it->expr && it->expr->type == AST_NODE_IDENTIFIER)
+                            nset_add(exports, ((cypher_identifier*)it->expr)->name);
+                        else {
+                            set_error(error_message, "SyntaxError: NoExpressionAlias: CALL return expressions require an alias");
+                            rc = -1; break;
+                        }
+                    }
+                }
                 break;
             }
             case AST_NODE_WITH: {
                 cypher_with *w = (cypher_with *)clause;
+                for (int wi = 0; initial && w->items && wi < w->items->count; wi++) {
+                    cypher_return_item *it = (cypher_return_item*)w->items->items[wi];
+                    rc = check_scoped_expr(it->expr, &bound, error_message);
+                    if (rc < 0) break;
+                    if (persistent && it->alias && nset_contains(persistent, it->alias) &&
+                        (!it->expr || it->expr->type != AST_NODE_IDENTIFIER ||
+                         strcmp(((cypher_identifier*)it->expr)->name, it->alias) != 0)) {
+                        set_error(error_message, "SyntaxError: VariableAlreadyBound: WITH cannot replace CALL import `%s`", it->alias);
+                        rc = -1; break;
+                    }
+                }
+                if (rc < 0) break;
                 rc = validate_with_clause(w, &vctx, error_message);
                 /* WITH projects a new scope: clear previously-bound names
                  * and add only the names this WITH carries forward. Items
@@ -2441,7 +2619,10 @@ int transform_validate_query(cypher_query *query, char **error_message)
                             nset_add(&bound, ((cypher_identifier *)it->expr)->name);
                         }
                     }
+                    for (int pi = 0; persistent && pi < persistent->count; pi++)
+                        nset_add(&bound, persistent->names[pi]);
                 }
+                if (rc == 0 && initial) rc = check_scoped_expr(w->where, &bound, error_message);
                 break;
             }
             case AST_NODE_MATCH: {
@@ -2463,6 +2644,7 @@ int transform_validate_query(cypher_query *query, char **error_message)
                 if (rc == 0 && m->where) {
                     rc = validate_where_pattern_vars(m->where, &bound, error_message);
                 }
+                if (rc == 0 && initial) rc = check_scoped_expr(m->where, &bound, error_message);
                 break;
             }
             case AST_NODE_LOAD_CSV: {
@@ -2482,6 +2664,11 @@ int transform_validate_query(cypher_query *query, char **error_message)
                     else if (y->expr && y->expr->type == AST_NODE_IDENTIFIER)
                         nset_add(&bound, ((cypher_identifier *)y->expr)->name);
                 }
+                break;
+            }
+            case AST_NODE_CALL_SUBQUERY: {
+                cypher_call_subquery *call = (cypher_call_subquery*)clause;
+                if (call->explicit_scope) rc = validate_scoped_call(call, &bound, &vctx, error_message);
                 break;
             }
             case AST_NODE_DELETE: {
@@ -2514,6 +2701,7 @@ int transform_validate_query(cypher_query *query, char **error_message)
             }
             case AST_NODE_UNWIND: {
                 cypher_unwind *u = (cypher_unwind *)clause;
+                if (initial && check_scoped_expr(u->expr, &bound, error_message) < 0) { rc = -1; break; }
                 rc = validate_unwind_clause(u, &vctx, error_message);
                 /* UNWIND introduces a new variable (Call1 [15] through a
                  * procedure row source, `WITH 1 AS x UNWIND [2] AS x`). */
@@ -2539,6 +2727,8 @@ int transform_validate_query(cypher_query *query, char **error_message)
                     for (int si = 0; si < s->items->count; si++) {
                         cypher_set_item *it = (cypher_set_item *)s->items->items[si];
                         if (!it) continue;
+                        if (initial && (check_scoped_expr(it->expr, &bound, error_message) < 0 ||
+                                        check_scoped_expr(it->property, &bound, error_message) < 0)) { rc = -1; break; }
                         if (it->expr && check_undef_in_expr(it->expr, &bound, "SET", error_message) < 0) { rc = -1; break; }
                         if (it->property && it->property->type == AST_NODE_PROPERTY) {
                             cypher_property *pr = (cypher_property *)it->property;
@@ -2630,4 +2820,9 @@ int transform_validate_query(cypher_query *query, char **error_message)
     nset_free(&bound);
     vctx_free(&vctx);
     return rc;
+}
+
+int transform_validate_query(cypher_query *query, char **error_message)
+{
+    return validate_query_scoped(query, error_message, NULL, NULL, NULL, NULL);
 }

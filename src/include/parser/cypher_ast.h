@@ -193,6 +193,10 @@ typedef struct cypher_foreach {
 typedef struct cypher_call_subquery {
     ast_node base;
     ast_list *branches;   /* List of subquery branches (one per UNION branch, each a query AST) */
+    bool explicit_scope; /* CALL (variables) / CALL (*) / CALL (); false for importing WITH */
+    bool import_all;     /* CALL (*) imports every outer variable */
+    ast_list *imports;   /* Owned AST_NODE_IDENTIFIER list for CALL (variables) */
+    ast_list *import_projections; /* Owned return items for CALL (expr AS alias), a compatibility extension */
 } cypher_call_subquery;
 
 /* CALL name(args) [YIELD a, b AS c [WHERE ...]] (GQLITE-T-0389) */
