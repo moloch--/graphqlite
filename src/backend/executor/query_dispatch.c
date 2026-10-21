@@ -6196,8 +6196,11 @@ static cypher_result *rw_run_call(cypher_executor *executor, cypher_call_subquer
         int nc = left->column_count, cap = left->row_count + right->row_count;
         char ***cells = calloc((size_t)(cap ? cap : 1), sizeof(char**));
         int **types = calloc((size_t)(cap ? cap : 1), sizeof(int*));
-        if (!cells || !types) {
-            free(cells); free(types);
+        bool has_agtype = left->agtype_data || right->agtype_data;
+        agtype_value ***agtypes = has_agtype
+            ? calloc((size_t)(cap ? cap : 1), sizeof(agtype_value**)) : NULL;
+        if (!cells || !types || (has_agtype && !agtypes)) {
+            free(cells); free(types); free(agtypes);
             cypher_result_free(left); cypher_result_free(right);
             set_result_error(result, "Out of memory collecting CALL UNION rows");
             return NULL;
@@ -6215,12 +6218,23 @@ static cypher_result *rw_run_call(cypher_executor *executor, cypher_call_subquer
             if (duplicate) {
                 for (int c = 0; c < nc; c++) free(left->data[r][c]);
                 free(left->data[r]); free(left->data_types[r]);
+                if (left->agtype_data && left->agtype_data[r]) {
+                    for (int c = 0; c < nc; c++) agtype_value_free(left->agtype_data[r][c]);
+                    free(left->agtype_data[r]);
+                }
             } else {
-                cells[kept] = left->data[r]; types[kept++] = left->data_types[r];
+                cells[kept] = left->data[r]; types[kept] = left->data_types[r];
+                if (left->agtype_data) agtypes[kept] = left->agtype_data[r];
+                kept++;
             }
         }
-        free(left->data); free(left->data_types);
+        free(left->data); free(left->data_types); free(left->agtype_data);
         left->data = cells; left->data_types = types; left->row_count = kept;
+        /* All result representations must follow the same row ownership and
+         * order. Leaving the old AGType array behind lets result cleanup read
+         * past its initialized rows after UNION appends or deduplicates. */
+        left->agtype_data = agtypes;
+        left->use_agtype = has_agtype;
         for (int r = 0; r < right->row_count; r++) {
             bool duplicate = false;
             for (int l = 0; !u->all && l < left->row_count && !duplicate; l++) {
@@ -6233,6 +6247,10 @@ static cypher_result *rw_run_call(cypher_executor *executor, cypher_call_subquer
             }
             if (duplicate) continue;
             left->data[left->row_count] = right->data[r]; right->data[r] = NULL;
+            if (right->agtype_data) {
+                left->agtype_data[left->row_count] = right->agtype_data[r];
+                right->agtype_data[r] = NULL;
+            }
             left->data_types[left->row_count++] = right->data_types[r]; right->data_types[r] = NULL;
         }
         left->nodes_created += right->nodes_created;

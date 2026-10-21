@@ -172,6 +172,10 @@ jobs:
 
       - name: Run functional tests (macOS)
         if: runner.os == 'macOS'
+        env:
+          # Make stale and uninitialized heap references fail deterministically.
+          MallocScribble: '1'
+          MallocPreScribble: '1'
         run: make test-functional EXTRA_INCLUDES="-I$HOMEBREW_PREFIX/include" EXTRA_LIBS="-L$HOMEBREW_PREFIX/lib" SQLITE="$SQLITE_PREFIX/bin/sqlite3"
 
   full-rust-tests:
