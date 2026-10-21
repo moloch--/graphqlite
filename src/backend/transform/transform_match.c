@@ -207,12 +207,340 @@ static char *label_alternatives_cond(cypher_transform_context *ctx, cypher_node_
     return out;
 }
 
+/* Rewrite generated SQL references without touching string literals or
+ * quoted identifiers. Shortest-path candidates use the same WHERE expression
+ * as the outer match, but its path and endpoint IDs belong to the candidate. */
+static char *replace_sql_references(const char *sql, const char **from,
+                                    const char **to, int count)
+{
+    dynamic_buffer out;
+    dbuf_init(&out);
+    for (const char *p = sql; *p;) {
+        if (*p == '\'' || *p == '"' || *p == '`') {
+            char quote = *p;
+            dbuf_append_char(&out, *p++);
+            while (*p) {
+                char c = *p++;
+                dbuf_append_char(&out, c);
+                if (c == quote) {
+                    if (*p == quote) { dbuf_append_char(&out, *p++); continue; }
+                    break;
+                }
+            }
+            continue;
+        }
+        bool replaced = false;
+        for (int i = 0; i < count; i++) {
+            size_t n = strlen(from[i]);
+            if (!n || strncmp(p, from[i], n) != 0) continue;
+            if (p > sql && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) continue;
+            if (from[i][n-1] != '.' &&
+                (isalnum((unsigned char)p[n]) || p[n] == '_')) continue;
+            dbuf_append(&out, to[i]);
+            p += n;
+            replaced = true;
+            break;
+        }
+        if (!replaced) dbuf_append_char(&out, *p++);
+    }
+    return dbuf_finish(&out);
+}
+
+static const char *find_shortest_marker(const char *sql, const char *marker)
+{
+    if (!sql) return NULL;
+    size_t length = strlen(marker);
+    for (const char *p = sql; *p;) {
+        if (*p == '\'' || *p == '"' || *p == '`') {
+            char quote = *p++;
+            while (*p) {
+                if (*p++ == quote) {
+                    if (*p == quote) { p++; continue; }
+                    break;
+                }
+            }
+        } else if (strncmp(p, marker, length) == 0) {
+            return p;
+        } else p++;
+    }
+    return NULL;
+}
+
+/* Remove generated marker-delimited clauses, never caller-supplied text. */
+static void remove_shortest_section(dynamic_buffer *buffer, const char *begin_marker,
+                                     const char *end_marker)
+{
+    for (;;) {
+        const char *sql = dbuf_get(buffer);
+        const char *begin = find_shortest_marker(sql, begin_marker);
+        const char *end = begin ? find_shortest_marker(begin, end_marker) : NULL;
+        if (!end) break;
+        dynamic_buffer rewritten;
+        dbuf_init(&rewritten);
+        dbuf_appendf(&rewritten, "%.*s", (int)(begin - sql), sql);
+        dbuf_append(&rewritten, end + strlen(end_marker));
+        dbuf_clear(buffer);
+        dbuf_append(buffer, dbuf_get(&rewritten));
+        dbuf_free(&rewritten);
+    }
+}
+
+static const char *varlen_binding(cypher_transform_context *ctx, const cypher_rel_pattern *rel)
+{
+    for (int i = 0; i < ctx->varlen_bindings_count; i++)
+        if (ctx->varlen_bindings[i].pattern == rel) return ctx->varlen_bindings[i].alias;
+    return NULL;
+}
+
+static int record_varlen_binding(cypher_transform_context *ctx, const cypher_rel_pattern *rel, const char *alias)
+{
+    char *copy = strdup(alias);
+    if (!copy) return -1;
+    for (int i = 0; i < ctx->varlen_bindings_count; i++) {
+        if (ctx->varlen_bindings[i].pattern == rel) {
+            free(ctx->varlen_bindings[i].alias);
+            ctx->varlen_bindings[i].alias = copy;
+            return 0;
+        }
+    }
+    void *grown = realloc(ctx->varlen_bindings, (ctx->varlen_bindings_count + 1) * sizeof(*ctx->varlen_bindings));
+    if (!grown) { free(copy); return -1; }
+    ctx->varlen_bindings = grown;
+    ctx->varlen_bindings[ctx->varlen_bindings_count].pattern = rel;
+    ctx->varlen_bindings[ctx->varlen_bindings_count++].alias = copy;
+    return 0;
+}
+
+static int apply_shortest_where(cypher_transform_context *ctx, cypher_match *match,
+                                const char *where_sql)
+{
+    for (int i = 0; i < match->pattern->count; i++) {
+        cypher_path *path = (cypher_path *)match->pattern->items[i];
+        if (path->type != PATH_TYPE_SHORTEST && path->type != PATH_TYPE_ALL_SHORTEST) continue;
+        if (!path->elements || path->elements->count != 3) continue;
+        cypher_node_pattern *source = (cypher_node_pattern *)path->elements->items[0];
+        cypher_rel_pattern *rel = (cypher_rel_pattern *)path->elements->items[1];
+        cypher_node_pattern *target = (cypher_node_pattern *)path->elements->items[2];
+        if (!rel->variable || !rel->varlen) continue;
+        const char *alias = varlen_binding(ctx, rel);
+        if (!alias) continue;
+        char edge_alias[128];
+        snprintf(edge_alias, sizeof(edge_alias), "%s", alias);
+        char edge_ref[160], source_ref[256] = "", target_ref[256] = "";
+        snprintf(edge_ref, sizeof(edge_ref), "%s.", edge_alias);
+        /* A WHERE predicate inspecting this path may reject the globally
+         * shortest route. In that case keep the complete relationship-unique
+         * search. Ignore quoted text when detecting SQL alias references. */
+        const char *path_from[] = {edge_ref};
+        const char *path_to[] = {"_gql_path_filter_reference."};
+        bool filters_path = false;
+        if (where_sql[0]) {
+            char *probe = replace_sql_references(where_sql, path_from, path_to, 1);
+            if (!probe) return -1;
+            filters_path = strcmp(probe, where_sql) != 0;
+            free(probe);
+        }
+        if (filters_path) {
+            char begin_marker[192], end_marker[192];
+            snprintf(begin_marker, sizeof(begin_marker), "/*_gql_prune_begin_%s*/", edge_alias);
+            snprintf(end_marker, sizeof(end_marker), "/*_gql_prune_end_%s*/", edge_alias);
+            remove_shortest_section(&ctx->unified_builder->cte, begin_marker, end_marker);
+        } else {
+            /* Pruned CTE rows are already shortest. Removing the redundant
+             * selector also avoids a second CTE reference that forces SQLite
+             * to materialize every tied path before an outer LIMIT can run. */
+            char begin_marker[192], end_marker[192];
+            snprintf(begin_marker, sizeof(begin_marker), "/*_gql_selector_begin_%s*/", edge_alias);
+            snprintf(end_marker, sizeof(end_marker), "/*_gql_selector_end_%s*/", edge_alias);
+            remove_shortest_section(&ctx->unified_builder->where, begin_marker, end_marker);
+            remove_shortest_section(&ctx->unified_builder->joins, begin_marker, end_marker);
+        }
+        if (!where_sql[0]) continue;
+        if (source->variable) {
+            alias = transform_var_get_alias(ctx->var_ctx, source->variable);
+            if (alias) snprintf(source_ref, sizeof(source_ref), "%s", get_node_id_ref(ctx, alias, source->variable));
+        }
+        if (target->variable) {
+            alias = transform_var_get_alias(ctx->var_ctx, target->variable);
+            if (alias) snprintf(target_ref, sizeof(target_ref), "%s", get_node_id_ref(ctx, alias, target->variable));
+        }
+        char candidate_ref[192], candidate_source[208], candidate_target[208];
+        snprintf(candidate_ref, sizeof(candidate_ref), "_gql_shortest_candidate_%s.", edge_alias);
+        snprintf(candidate_source, sizeof(candidate_source), "%sstart_id", candidate_ref);
+        snprintf(candidate_target, sizeof(candidate_target), "%send_id", candidate_ref);
+        const char *from[] = {edge_ref, source_ref, target_ref};
+        const char *to[] = {candidate_ref, candidate_source, candidate_target};
+        char *candidate = replace_sql_references(where_sql, from, to, 3);
+        if (!candidate) return -1;
+        dynamic_buffer predicate;
+        dbuf_init(&predicate);
+        dbuf_appendf(&predicate, " AND (%s) ", candidate);
+        free(candidate);
+        char marker[192];
+        snprintf(marker, sizeof(marker), "/*_gql_shortest_where_%s*/", edge_alias);
+        const char *markers[] = {marker};
+        const char *predicates[] = {dbuf_get(&predicate)};
+        dynamic_buffer *buffers[] = {&ctx->unified_builder->where, &ctx->unified_builder->joins};
+        for (int b = 0; b < 2; b++) {
+            const char *sql = dbuf_get(buffers[b]);
+            if (!sql || !strstr(sql, marker)) continue;
+            char *rewritten = replace_sql_references(sql, markers, predicates, 1);
+            if (!rewritten) { dbuf_free(&predicate); return -1; }
+            dbuf_clear(buffers[b]);
+            dbuf_append(buffers[b], rewritten);
+            free(rewritten);
+        }
+        dbuf_free(&predicate);
+    }
+    return 0;
+}
+
+/* Find generated JOIN/ON boundaries at SQL nesting depth zero. Quoted text,
+ * comments and subqueries may contain those words without delimiting a join. */
+static const char *optional_sql_boundary(const char *sql, bool on, size_t *length)
+{
+    int depth = 0;
+    for (const char *p = sql; *p;) {
+        if (*p == '\'' || *p == '"' || *p == '`') {
+            char quote = *p++;
+            while (*p) { if (*p++ == quote) { if (*p == quote) p++; else break; } }
+        } else if (p[0] == '/' && p[1] == '*') {
+            const char *end = strstr(p + 2, "*/");
+            p = end ? end + 2 : p + strlen(p);
+        } else if (*p == '(') { depth++; p++; }
+        else if (*p == ')') { depth--; p++; }
+        else if (!depth) {
+            const char *keywords[] = {" LEFT JOIN ", " CROSS JOIN ", " JOIN ", " ON "};
+            for (int i = on ? 3 : 0; i < (on ? 4 : 3); i++) {
+                size_t n = strlen(keywords[i]);
+                if (!strncmp(p, keywords[i], n)) { *length = n; return p; }
+            }
+            p++;
+        } else p++;
+    }
+    return NULL;
+}
+
+/* OPTIONAL MATCH null-extends the complete pattern, not each path segment.
+ * Form one RHS from this clause's newly introduced tables. All correlation,
+ * endpoint and WHERE constraints belong on its outer ON, where every new
+ * alias and all previously bound aliases are in scope. */
+static int group_optional_varlen_clause(sql_builder *builder, size_t joins_start,
+                                        size_t where_start, int where_count)
+{
+    const char *joins = dbuf_get(&builder->joins);
+    if (!joins || strlen(joins) == joins_start) return 0;
+    dynamic_buffer tables, conditions, result;
+    dbuf_init(&tables); dbuf_init(&conditions); dbuf_init(&result);
+    const char *cursor = joins + joins_start;
+    bool first = true;
+    int table_count = 0;
+    while (*cursor) {
+        size_t keyword_len = 0;
+        const char *boundary = optional_sql_boundary(cursor, false, &keyword_len);
+        if (boundary != cursor) goto invalid;
+        const char *table = cursor + keyword_len;
+        size_t ignored = 0;
+        const char *next = optional_sql_boundary(table, false, &ignored);
+        const char *end = next ? next : table + strlen(table);
+        const char *on = optional_sql_boundary(table, true, &ignored);
+        if (on && on >= end) on = NULL;
+        if (!first) dbuf_append(&tables, " JOIN ");
+        dbuf_appendf(&tables, "%.*s", (int)((on ? on : end) - table), table);
+        if (!first) dbuf_append(&tables, " ON 1=1");
+        first = false;
+        table_count++;
+        if (on) {
+            if (!dbuf_is_empty(&conditions)) dbuf_append(&conditions, " AND ");
+            dbuf_appendf(&conditions, "(%.*s)", (int)(end - (on + 4)), on + 4);
+        }
+        cursor = end;
+    }
+    const char *where = dbuf_get(&builder->where);
+    if (where && strlen(where) > where_start) {
+        if (!dbuf_is_empty(&conditions)) dbuf_append(&conditions, " AND ");
+        dbuf_appendf(&conditions, "(%s)", where + where_start + (where_count ? 5 : 0));
+        builder->where.len = where_start;
+        builder->where.data[where_start] = '\0';
+        builder->where_count = where_count;
+    }
+    /* SQLite drops a CTE's inner alias for the single-table `(cte AS alias)`
+     * form. Grouping is needed only when the nullable RHS has multiple tables. */
+    dbuf_appendf(&result, "%.*s LEFT JOIN %s%s%s ON %s", (int)joins_start, joins,
+                 table_count > 1 ? "(" : "", dbuf_get(&tables), table_count > 1 ? ")" : "",
+                 dbuf_is_empty(&conditions) ? "1=1" : dbuf_get(&conditions));
+    dbuf_clear(&builder->joins);
+    dbuf_append(&builder->joins, dbuf_get(&result));
+    dbuf_free(&tables); dbuf_free(&conditions); dbuf_free(&result);
+    return 0;
+invalid:
+    dbuf_free(&tables); dbuf_free(&conditions); dbuf_free(&result);
+    return -1;
+}
+
+/* Relationship uniqueness is scoped to the entire MATCH, including comma
+ * patterns. Compare only this clause's bindings, never earlier MATCH paths. */
+static void optional_varlen_uniqueness(cypher_transform_context *ctx, cypher_match *match)
+{
+    for (int pi = 0; pi < match->pattern->count; pi++) {
+        cypher_path *left = (cypher_path *)match->pattern->items[pi];
+        for (int li = 0; li < left->elements->count; li++) {
+            ast_node *a = left->elements->items[li];
+            if (a->type != AST_NODE_REL_PATTERN) continue;
+            cypher_rel_pattern *ra = (cypher_rel_pattern *)a;
+            const char *aa = ra->varlen ? varlen_binding(ctx, ra) : transform_var_get_alias(ctx->var_ctx, ra->variable);
+            if (!aa) continue;
+            for (int pj = pi; pj < match->pattern->count; pj++) {
+                cypher_path *right = (cypher_path *)match->pattern->items[pj];
+                for (int ri = pj == pi ? li + 1 : 0; ri < right->elements->count; ri++) {
+                    ast_node *b = right->elements->items[ri];
+                    if (b->type != AST_NODE_REL_PATTERN) continue;
+                    cypher_rel_pattern *rb = (cypher_rel_pattern *)b;
+                    if (!ra->varlen && !rb->varlen) continue;
+                    const char *ba = rb->varlen ? varlen_binding(ctx, rb) : transform_var_get_alias(ctx->var_ctx, rb->variable);
+                    if (!ba) continue;
+                    dynamic_buffer condition;
+                    dbuf_init(&condition);
+                    if (ra->varlen && rb->varlen) {
+                        dbuf_appendf(&condition,
+                            "NOT EXISTS (SELECT 1 FROM json_each('[' || trim(%s.visited, ',') || ']') AS _gql_used_edge "
+                            "WHERE instr(%s.visited, ',' || _gql_used_edge.value || ',') > 0)", aa, ba);
+                    } else {
+                        const char *many = ra->varlen ? aa : ba;
+                        const char *one = ra->varlen ? ba : aa;
+                        dbuf_appendf(&condition, "instr(%s.visited, ',' || %s%s || ',') = 0",
+                                     many, one, strchr(one, '.') ? "" : ".id");
+                    }
+                    sql_where(ctx->unified_builder, dbuf_get(&condition));
+                    dbuf_free(&condition);
+                }
+            }
+        }
+    }
+}
+
 /* Transform a MATCH clause into SQL */
 int transform_match_clause(cypher_transform_context *ctx, cypher_match *match)
 {
     /* Joins before this clause: only a MATCH that starts the query groups its
      * leading-OPTIONAL joins (Graph6 [6], not Aggregation5 [2]). */
     size_t joins_at_start = sql_builder_joins_len(ctx->unified_builder);
+    size_t where_at_start = dbuf_len(&ctx->unified_builder->where);
+    int where_count_at_start = ctx->unified_builder->where_count;
+    bool optional_varlen = false;
+    bool previous_optional_grouping = ctx->grouping_optional_varlen;
+    if (match && match->optional) {
+        for (int p = 0; p < match->pattern->count; p++) {
+            cypher_path *path = (cypher_path *)match->pattern->items[p];
+            if (!path->elements) continue;
+            for (int e = 0; e < path->elements->count; e++) {
+                ast_node *element = path->elements->items[e];
+                if (element->type == AST_NODE_REL_PATTERN && ((cypher_rel_pattern *)element)->varlen)
+                    optional_varlen = true;
+            }
+        }
+    }
+    ctx->grouping_optional_varlen = optional_varlen;
 
     CYPHER_DEBUG("Transforming %s MATCH clause", match->optional ? "OPTIONAL" : "regular");
 
@@ -268,6 +596,9 @@ int transform_match_clause(cypher_transform_context *ctx, cypher_match *match)
     
     /* For OPTIONAL MATCH, skip pattern constraint generation (constraints are in JOIN ON clauses) */
     if (match->optional) {
+        /* The complete varlen clause is grouped below; per-edge rewrites
+         * cannot reference aliases introduced by later path segments. */
+        if (optional_varlen) cypher_transform_clear_defer_pairs(ctx);
         goto handle_where_clause;
     }
     for (int i = 0; i < match->pattern->count; i++) {
@@ -803,6 +1134,14 @@ handle_where_clause:
             return -1;
         }
 
+        /* Cypher shortestPath searches among paths satisfying this MATCH's
+         * WHERE. Selecting a tied path before applying a path predicate can
+         * discard a valid alternative (or a longer valid path). */
+        if (apply_shortest_where(ctx, match, ctx->sql_buffer) < 0) {
+            free(saved_buffer);
+            return -1;
+        }
+
         /* Add the expression to the appropriate clause.
          * For OPTIONAL MATCH, append to the last LEFT JOIN's ON clause
          * rather than the outer WHERE, so NULL rows are preserved (issue #34b). */
@@ -926,6 +1265,11 @@ handle_where_clause:
         }
     }
 
+    if (!match->where && apply_shortest_where(ctx, match, "") < 0) return -1;
+    /* A clause without WHERE must not lend its deferred aliases to a later
+     * MATCH predicate. Its placeholder is an inert SQL comment. */
+    cypher_transform_clear_defer_pairs(ctx);
+
     /* I-0047 P3: flush any stashed bound-rel OPTIONAL endpoint constraint onto
      * the last LEFT JOIN's ON (the fresh target node's join, now emitted).
      * Runs whether or not a WHERE clause was present (Match7 [4],
@@ -937,12 +1281,21 @@ handle_where_clause:
     }
 
     /* A leading OPTIONAL MATCH matches as one unit (Graph6 [6]). */
-    if (match->optional && joins_at_start == 0) {
+    if (optional_varlen) {
+        optional_varlen_uniqueness(ctx, match);
+        if (group_optional_varlen_clause(ctx->unified_builder, joins_at_start,
+                                        where_at_start, where_count_at_start) < 0) {
+            ctx->has_error = true;
+            ctx->error_message = strdup("Failed to group OPTIONAL variable-length clause");
+            return -1;
+        }
+    } else if (match->optional && joins_at_start == 0) {
         sql_builder_group_anchor_joins(ctx->unified_builder);
     }
 
     /* Clear current graph after MATCH processing */
     ctx->current_graph = NULL;
+    ctx->grouping_optional_varlen = previous_optional_grouping;
 
     return 0;
 }
@@ -1033,7 +1386,7 @@ static int transform_match_pattern(cypher_transform_context *ctx, ast_node *patt
      * EXISTS even when rel2 doesn't match — wrong per Cypher
      * 'all-or-none' OPTIONAL semantics. */
     bool path_combined_exists = false;
-    if (optional && path->elements && path->elements->count >= 5) {
+    if (optional && !ctx->grouping_optional_varlen && path->elements && path->elements->count >= 5) {
         int n_rels = 0;
         bool all_eligible = true;
         bool has_user_rel_var = false;
@@ -1083,7 +1436,7 @@ static int transform_match_pattern(cypher_transform_context *ctx, ast_node *patt
      * the per-rel emission either cross-multiplies or filters the anchor
      * row away. Route it through the derived-table chain below, which
      * pins the edge by id and yields both endpoint ids. */
-    if (!path_combined_exists && optional && path->elements &&
+    if (!path_combined_exists && optional && !ctx->grouping_optional_varlen && path->elements &&
         path->elements->count == 3 &&
         path->elements->items[0]->type == AST_NODE_NODE_PATTERN &&
         path->elements->items[1]->type == AST_NODE_REL_PATTERN &&
@@ -1127,7 +1480,7 @@ static int transform_match_pattern(cypher_transform_context *ctx, ast_node *patt
              * use a WHERE-based constraint emission, not a fresh edge
              * JOIN. The endpoint node JOINs must come from the path
              * loop's generate_node_match — don't defer them. */
-            if (r->variable &&
+            if (r->variable && !r->varlen &&
                 transform_var_alias_is_id(ctx->var_ctx, r->variable)) {
                 continue;
             }
@@ -1160,6 +1513,13 @@ static int transform_match_pattern(cypher_transform_context *ctx, ast_node *patt
             /* Defer the unavailable endpoint when the OTHER endpoint
              * is available (so this rel's ON can anchor to it). */
             int n_el = path->elements->count;
+            /* An uncorrelated optional varlen pattern is one nullable unit.
+             * Scanning either fresh endpoint separately creates inner/cross
+             * joins that erase the outer row when the path is absent. */
+            if (r->varlen && !src_avail && !tgt_avail) {
+                defer_to_rel[j - 1] = defer_to_rel[j + 1] = true;
+                defer_to_rel[n_el + j] = defer_to_rel[2 * n_el + j] = true;
+            }
             if (!src_avail && tgt_avail) {
                 defer_to_rel[j - 1] = true;
                 defer_to_rel[n_el + j] = true;
@@ -2321,6 +2681,68 @@ static bool build_anchor_ids_sql(cypher_transform_context *ctx, const char *alia
     return emitted > 0;
 }
 
+/* An OPTIONAL path must reject a non-matching endpoint before the path's
+ * LEFT JOIN, rather than keeping the path and nulling only its endpoint node.
+ * Express endpoint constraints using the CTE's id, which is already in scope. */
+static int append_optional_endpoint_constraints(cypher_transform_context *ctx,
+                                                cypher_node_pattern *node,
+                                                const char *id_ref,
+                                                dynamic_buffer *condition)
+{
+    char *alt = label_alternatives_cond(ctx, node, id_ref);
+    if (alt) { dbuf_append(condition, alt); free(alt); }
+    if (has_labels(node)) {
+        for (int i = 0; i < node->labels->count; i++) {
+            const char *label = get_label_string(node->labels->items[i]);
+            if (!label) continue;
+            char *escaped = escape_sql_string(label);
+            dbuf_appendf(condition,
+                " AND EXISTS (SELECT 1 FROM %s WHERE node_id = %s AND label = '%s')",
+                get_graph_table(ctx, "node_labels"), id_ref, escaped ? escaped : label);
+            free(escaped);
+        }
+    }
+    if (!node->properties || node->properties->type != AST_NODE_MAP) return 0;
+    cypher_map *map = (cypher_map *)node->properties;
+    if (!map->pairs) return 0;
+
+    /* Reuse typed property equality instead of duplicating the scalar/JSON/
+     * parameter rules. The temporary symbol is a node ID, never a new scan. */
+    int saved_vars = transform_var_count(ctx->var_ctx);
+    char *name = get_next_default_alias(ctx);
+    while (name && transform_var_lookup(ctx->var_ctx, name)) {
+        free(name);
+        name = get_next_default_alias(ctx);
+    }
+    if (!name || transform_var_register_node(ctx->var_ctx, name, id_ref, NULL) < 0) {
+        free(name);
+        ctx->has_error = true;
+        free(ctx->error_message);
+        ctx->error_message = strdup("Failed to bind OPTIONAL path endpoint");
+        return -1;
+    }
+    transform_var_set_alias_is_id(ctx->var_ctx, name, true);
+    if (ctx->current_graph) transform_var_set_graph(ctx->var_ctx, name, ctx->current_graph);
+    cypher_identifier id = {.base = {.type = AST_NODE_IDENTIFIER}, .name = name};
+    int rc = 0;
+    for (int i = 0; i < map->pairs->count; i++) {
+        cypher_map_pair *pair = (cypher_map_pair *)map->pairs->items[i];
+        if (!pair->key || !pair->value) continue;
+        cypher_property prop = {.base = {.type = AST_NODE_PROPERTY},
+                                .expr = (ast_node *)&id, .property_name = pair->key};
+        cypher_binary_op equal = {.base = {.type = AST_NODE_BINARY_OP},
+                                  .op_type = BINARY_OP_EQ,
+                                  .left = (ast_node *)&prop, .right = pair->value};
+        char *sql = cypher_transform_capture_expression(ctx, (ast_node *)&equal);
+        if (!sql) { rc = -1; break; }
+        dbuf_appendf(condition, " AND (%s)", sql);
+        free(sql);
+    }
+    transform_var_truncate_to(ctx->var_ctx, saved_vars);
+    free(name);
+    return rc;
+}
+
 static int generate_relationship_match(cypher_transform_context *ctx, cypher_rel_pattern *rel,
                                      cypher_node_pattern *source_node, cypher_node_pattern *target_node,
                                      int rel_index, bool optional, path_type ptype,
@@ -2450,7 +2872,7 @@ static int generate_relationship_match(cypher_transform_context *ctx, cypher_rel
 
         /* Generate unique CTE name */
         char cte_name[64];
-        snprintf(cte_name, sizeof(cte_name), "_varlen_path_%d", rel_index);
+        snprintf(cte_name, sizeof(cte_name), "_varlen_path_%d", ctx->anon_node_base + rel_index);
 
         /* T-0309: mark this rel variable as varlen-bound so the RETURN
          * projector emits a list-of-edges JSON array (and the result
@@ -2472,8 +2894,28 @@ static int generate_relationship_match(cypher_transform_context *ctx, cypher_rel
         dynamic_buffer anchor_ids;
         dbuf_init(&anchor_ids);
         bool have_anchor = build_anchor_ids_sql(ctx, source_alias, source_node, &anchor_ids);
+        cypher_varlen_range *prune_range = (cypher_varlen_range *)rel->varlen;
+        bool prune_shortest = (ptype == PATH_TYPE_SHORTEST || ptype == PATH_TYPE_ALL_SHORTEST)
+            && prune_range->min_hops <= 1 && !bound_rels[0] && !rel->properties
+            && !ctx->current_graph && (rel->left_arrow != rel->right_arrow);
+        dynamic_buffer bound_edge_ids;
+        dbuf_init(&bound_edge_ids);
+        if (bound_rels[0]) {
+            const char *dot = strchr(bound_rels, '.');
+            bool simple_cte = dot && dot > bound_rels;
+            for (const char *p = bound_rels; simple_cte && p < dot; p++)
+                if (!(isalnum((unsigned char)*p) || *p == '_')) simple_cte = false;
+            if (simple_cte)
+                dbuf_appendf(&bound_edge_ids,
+                    "SELECT COALESCE(json_extract(_gql_bound_edge.value, '$.id'), _gql_bound_edge.value) "
+                    "FROM %.*s JOIN json_each(%s) AS _gql_bound_edge",
+                    (int)(dot - bound_rels), bound_rels, bound_rels);
+        }
         int cte_rc = generate_varlen_cte(ctx, rel, source_alias, target_alias, cte_name,
-                                         have_anchor ? dbuf_get(&anchor_ids) : NULL);
+                                         have_anchor ? dbuf_get(&anchor_ids) : NULL,
+                                         prune_shortest ? edge_alias : NULL, ptype == PATH_TYPE_SHORTEST,
+                                         dbuf_is_empty(&bound_edge_ids) ? NULL : dbuf_get(&bound_edge_ids));
+        dbuf_free(&bound_edge_ids);
         dbuf_free(&anchor_ids);
         if (cte_rc < 0) {
             ctx->has_error = true;
@@ -2505,16 +2947,12 @@ static int generate_relationship_match(cypher_transform_context *ctx, cypher_rel
         bool edge_alias_is_colref = (edge_alias && strchr(edge_alias, '.') != NULL);
         bool target_alias_is_colref = (target_alias && strchr(target_alias, '.') != NULL);
         char fresh_cte_alias[64];
-        char fresh_target_alias[64];
         if (edge_alias_is_colref) {
             snprintf(fresh_cte_alias, sizeof(fresh_cte_alias),
-                     "_vp_inner_%d", rel_index);
+                     "_vp_inner_%d", ctx->anon_node_base + rel_index);
             edge_alias = fresh_cte_alias;
         }
-        if (target_alias_is_colref) {
-            snprintf(fresh_target_alias, sizeof(fresh_target_alias),
-                     "_vp_tgt_%d", rel_index);
-        }
+        if (record_varlen_binding(ctx, rel, edge_alias) < 0) return -1;
 
         /* Join the main query with the CTE result using unified builder.
          * T-0261: for OPTIONAL MATCH, use LEFT JOIN with a placeholder
@@ -2524,6 +2962,8 @@ static int generate_relationship_match(cypher_transform_context *ctx, cypher_rel
          * append_on previously produced malformed SQL like
          * `CROSS JOIN ... AS alias AND (...)`). */
         if (optional) {
+            if (dbuf_is_empty(&ctx->unified_builder->from))
+                sql_from(ctx->unified_builder, "(SELECT 1)", "_gql_anchor");
             sql_join(ctx->unified_builder, SQL_JOIN_LEFT, cte_name, edge_alias, "1=1");
         } else {
             sql_join(ctx->unified_builder, SQL_JOIN_CROSS, cte_name, edge_alias, NULL);
@@ -2688,6 +3128,11 @@ skip_target_node_join: ;  /* null statement: a label may not precede a
                     strncat(deferred_tgt_label_cond, one,
                             sizeof(deferred_tgt_label_cond) - strlen(deferred_tgt_label_cond) - 1);
                 }
+            } else if (target_alias_is_colref) {
+                /* A correlated / WITH-bound endpoint is an ID expression,
+                 * not a table alias. Its node-pattern pass already emits the
+                 * label predicate; synthesizing `_nl_<alias>_0` here would
+                 * put a dot from that expression into an SQL identifier. */
             } else {
                 for (int i = 0; i < target_node->labels->count; i++) {
                     const char *label = get_label_string(target_node->labels->items[i]);
@@ -2739,6 +3184,9 @@ skip_target_node_join: ;  /* null statement: a label may not precede a
         if (varlen_first_cond) {
             dbuf_append(&on_cond, "1=1");
         }
+        if (src_deferred && tgt_deferred && source_node->variable && target_node->variable &&
+            !strcmp(source_node->variable, target_node->variable))
+            dbuf_appendf(&on_cond, " AND %s.start_id = %s.end_id", edge_alias, edge_alias);
 
         /* Always honor min_hops (zero-hop rows come from the CTE base case
          * we just added; bound-1 paths are excluded if min > 1). */
@@ -2756,15 +3204,60 @@ skip_target_node_join: ;  /* null statement: a label may not precede a
         }
         if (bound_rels[0]) {
             dbuf_appendf(&on_cond,
-                " AND %s.visited = (SELECT ',' || group_concat(COALESCE(json_extract(value, '$.id'), value), ',') || ',' "
-                "FROM json_each(%s))", edge_alias, bound_rels);
+                " AND %s.depth = json_array_length(%s) AND %s.visited = "
+                "(SELECT ',' || COALESCE(group_concat(COALESCE(json_extract(value, '$.id'), value), ',') || ',', '') "
+                "FROM json_each(%s))", edge_alias, bound_rels, edge_alias, bound_rels);
         }
 
-        /* Add shortest path filtering based on path type */
-        if (ptype == PATH_TYPE_SHORTEST || ptype == PATH_TYPE_ALL_SHORTEST) {
-            CYPHER_DEBUG("Adding shortest path filtering (type=%d)", ptype);
-            dbuf_appendf(&on_cond, " AND %s.depth = (SELECT MIN(sp.depth) FROM %s sp WHERE sp.start_id = %s AND sp.end_id = %s)",
-                         edge_alias, cte_name, src_id_ref, tgt_id_ref);
+        /* Select independently for each endpoint pair, after applying the
+         * lower hop bound. shortestPath chooses one tied path; allShortestPaths
+         * keeps every minimum-length path. The interleaved node/edge IDs give
+         * a stable tie-break without depending on the recursive query
+         * enumeration order. Correlate through the current CTE row so an
+         * OPTIONAL endpoint need not already be joined. */
+        /* The candidate alias is unique to this path so a shortestPath
+         * inside a correlated EXISTS cannot shadow the outer candidate. */
+        char candidate_alias[192];
+        snprintf(candidate_alias, sizeof(candidate_alias), "_gql_shortest_candidate_%s", edge_alias);
+        if (prune_shortest && min_hops == 1)
+            dbuf_appendf(&on_cond, " /*_gql_selector_begin_%s*/", edge_alias);
+        if (ptype == PATH_TYPE_SHORTEST) {
+            dbuf_appendf(&on_cond,
+                " AND %s.elem_ids = (SELECT %s.elem_ids FROM %s %s "
+                "WHERE %s.start_id = %s.start_id AND %s.end_id = %s.end_id "
+                "AND %s.depth >= %d /*_gql_shortest_where_%s*/ ORDER BY %s.depth, %s.elem_ids LIMIT 1)",
+                edge_alias, candidate_alias, cte_name, candidate_alias,
+                candidate_alias, edge_alias, candidate_alias, edge_alias,
+                candidate_alias, min_hops, edge_alias, candidate_alias, candidate_alias);
+        } else if (ptype == PATH_TYPE_ALL_SHORTEST) {
+            dbuf_appendf(&on_cond,
+                " AND %s.depth = (SELECT MIN(%s.depth) FROM %s %s "
+                "WHERE %s.start_id = %s.start_id AND %s.end_id = %s.end_id "
+                "AND %s.depth >= %d /*_gql_shortest_where_%s*/)",
+                edge_alias, candidate_alias, cte_name, candidate_alias,
+                candidate_alias, edge_alias, candidate_alias, edge_alias,
+                candidate_alias, min_hops, edge_alias);
+        }
+
+        if (prune_shortest && min_hops == 1)
+            dbuf_appendf(&on_cond, " /*_gql_selector_end_%s*/", edge_alias);
+
+        if (optional && (src_deferred || tgt_deferred)) {
+            char endpoint_id[128];
+            if (src_deferred) {
+                snprintf(endpoint_id, sizeof(endpoint_id), "%s.start_id", edge_alias);
+                if (append_optional_endpoint_constraints(ctx, source_node, endpoint_id, &on_cond) < 0) {
+                    dbuf_free(&on_cond);
+                    return -1;
+                }
+            }
+            if (tgt_deferred) {
+                snprintf(endpoint_id, sizeof(endpoint_id), "%s.end_id", edge_alias);
+                if (append_optional_endpoint_constraints(ctx, target_node, endpoint_id, &on_cond) < 0) {
+                    dbuf_free(&on_cond);
+                    return -1;
+                }
+            }
         }
 
         /* T-0261: for OPTIONAL, attach varlen constraints to the LEFT
@@ -2999,7 +3492,7 @@ skip_target_node_join: ;  /* null statement: a label may not precede a
                     exists_deferred_in_scope = true;
                 }
             }
-            if (no_user_rel_var && !has_path_var && !exists_deferred_in_scope &&
+            if (!ctx->grouping_optional_varlen && no_user_rel_var && !has_path_var && !exists_deferred_in_scope &&
                 ((src_deferred && !tgt_deferred) || (!src_deferred && tgt_deferred))) {
                 /* Determine the deferred-endpoint alias and direction. */
                 const char *deferred_alias;

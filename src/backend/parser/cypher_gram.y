@@ -1386,117 +1386,31 @@ label_list:
     ;
 
 rel_type_list:
-    IDENTIFIER '|' IDENTIFIER
+    label_name '|' label_name
         {
             $$ = ast_list_create();
-            cypher_literal *type_lit1 = make_string_literal($1, @1.first_line);
-            cypher_literal *type_lit3 = make_string_literal($3, @3.first_line);
-            ast_list_append($$, (ast_node*)type_lit1);
-            ast_list_append($$, (ast_node*)type_lit3);
-            free($1);
+            ast_list_append($$, (ast_node*)make_string_literal($1, @1.first_line));
+            ast_list_append($$, (ast_node*)make_string_literal($3, @3.first_line));
+            free($1); free($3);
+        }
+    | label_name '|' ':' label_name
+        {
+            $$ = ast_list_create();
+            ast_list_append($$, (ast_node*)make_string_literal($1, @1.first_line));
+            ast_list_append($$, (ast_node*)make_string_literal($4, @4.first_line));
+            free($1); free($4);
+        }
+    | rel_type_list '|' label_name
+        {
+            ast_list_append($1, (ast_node*)make_string_literal($3, @3.first_line));
             free($3);
-        }
-    | IDENTIFIER '|' ':' IDENTIFIER
-        {
-            /* Support [:TYPE1|:TYPE2] syntax with colon before second type */
-            $$ = ast_list_create();
-            cypher_literal *type_lit1 = make_string_literal($1, @1.first_line);
-            cypher_literal *type_lit4 = make_string_literal($4, @4.first_line);
-            ast_list_append($$, (ast_node*)type_lit1);
-            ast_list_append($$, (ast_node*)type_lit4);
-            free($1);
-            free($4);
-        }
-    | IDENTIFIER '|' BQIDENT
-        {
-            $$ = ast_list_create();
-            cypher_literal *type_lit1 = make_string_literal($1, @1.first_line);
-            cypher_literal *type_lit3 = make_string_literal($3, @3.first_line);
-            ast_list_append($$, (ast_node*)type_lit1);
-            ast_list_append($$, (ast_node*)type_lit3);
-            free($1);
-            free($3);
-        }
-    | IDENTIFIER '|' ':' BQIDENT
-        {
-            /* Support [:TYPE1|:`backtick-type`] syntax */
-            $$ = ast_list_create();
-            cypher_literal *type_lit1 = make_string_literal($1, @1.first_line);
-            cypher_literal *type_lit4 = make_string_literal($4, @4.first_line);
-            ast_list_append($$, (ast_node*)type_lit1);
-            ast_list_append($$, (ast_node*)type_lit4);
-            free($1);
-            free($4);
-        }
-    | BQIDENT '|' IDENTIFIER
-        {
-            $$ = ast_list_create();
-            cypher_literal *type_lit1 = make_string_literal($1, @1.first_line);
-            cypher_literal *type_lit3 = make_string_literal($3, @3.first_line);
-            ast_list_append($$, (ast_node*)type_lit1);
-            ast_list_append($$, (ast_node*)type_lit3);
-            free($1);
-            free($3);
-        }
-    | BQIDENT '|' ':' IDENTIFIER
-        {
-            /* Support [:`backtick-type`|:TYPE2] syntax */
-            $$ = ast_list_create();
-            cypher_literal *type_lit1 = make_string_literal($1, @1.first_line);
-            cypher_literal *type_lit4 = make_string_literal($4, @4.first_line);
-            ast_list_append($$, (ast_node*)type_lit1);
-            ast_list_append($$, (ast_node*)type_lit4);
-            free($1);
-            free($4);
-        }
-    | BQIDENT '|' BQIDENT
-        {
-            $$ = ast_list_create();
-            cypher_literal *type_lit1 = make_string_literal($1, @1.first_line);
-            cypher_literal *type_lit3 = make_string_literal($3, @3.first_line);
-            ast_list_append($$, (ast_node*)type_lit1);
-            ast_list_append($$, (ast_node*)type_lit3);
-            free($1);
-            free($3);
-        }
-    | BQIDENT '|' ':' BQIDENT
-        {
-            /* Support [:`backtick-type`|:`backtick-type2`] syntax */
-            $$ = ast_list_create();
-            cypher_literal *type_lit1 = make_string_literal($1, @1.first_line);
-            cypher_literal *type_lit4 = make_string_literal($4, @4.first_line);
-            ast_list_append($$, (ast_node*)type_lit1);
-            ast_list_append($$, (ast_node*)type_lit4);
-            free($1);
-            free($4);
-        }
-    | rel_type_list '|' IDENTIFIER
-        {
-            cypher_literal *type_lit = make_string_literal($3, @3.first_line);
-            ast_list_append($1, (ast_node*)type_lit);
             $$ = $1;
-            free($3);
         }
-    | rel_type_list '|' BQIDENT
+    | rel_type_list '|' ':' label_name
         {
-            cypher_literal *type_lit = make_string_literal($3, @3.first_line);
-            ast_list_append($1, (ast_node*)type_lit);
-            $$ = $1;
-            free($3);
-        }
-    | rel_type_list '|' ':' IDENTIFIER
-        {
-            cypher_literal *type_lit = make_string_literal($4, @4.first_line);
-            ast_list_append($1, (ast_node*)type_lit);
-            $$ = $1;
+            ast_list_append($1, (ast_node*)make_string_literal($4, @4.first_line));
             free($4);
-        }
-    | rel_type_list '|' ':' BQIDENT
-        {
-            cypher_literal *type_lit = make_string_literal($4, @4.first_line);
-            ast_list_append($1, (ast_node*)type_lit);
             $$ = $1;
-            free($4);
         }
     ;
 

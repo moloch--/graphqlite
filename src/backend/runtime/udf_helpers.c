@@ -22,7 +22,9 @@
 #include <strings.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <regex.h>
+#define PCRE2_CODE_UNIT_WIDTH 8
+#define PCRE2_STATIC 1
+#include "pcre2.h"
 #include <time.h>
 #include <stdbool.h>
 #include <math.h>
@@ -3555,15 +3557,20 @@ void gql_temporal_field_func(sqlite3_context *ctx, int argc, sqlite3_value **arg
             return;
         }
     }
-    /* epochSeconds / epochMillis. */
+    /* Temporal field names are case-insensitive in Cypher. BloodHound's query
+     * library uses epochseconds while the documented spelling is epochSeconds.
+     * Neo4j derives epochSeconds by truncating epochMillis / 1000 toward zero.
+     * Compute the whole seconds separately so pre-epoch instants match that
+     * behavior without depending on time_t's platform range. */
     if (p.has_date && p.has_time) {
-        if (strcmp(field, "epochSeconds") == 0 || strcmp(field, "epochMillis") == 0) {
-            struct tm t; memset(&t, 0, sizeof(t));
-            t.tm_year = p.y - 1900; t.tm_mon = p.mo - 1; t.tm_mday = p.d;
-            t.tm_hour = p.h; t.tm_min = p.mi; t.tm_sec = p.sec;
-            time_t ts = timegm(&t) - (time_t)p.tz_offset_min * 60;
-            if (strcmp(field, "epochSeconds") == 0) { sqlite3_result_int64(ctx, (int64_t)ts); return; }
-            sqlite3_result_int64(ctx, (int64_t)ts * 1000 + p.ns / 1000000);
+        if (strcasecmp(field, "epochSeconds") == 0 || strcasecmp(field, "epochMillis") == 0) {
+            int64_t seconds = days_from_civil(p.y, p.mo, p.d) * 86400LL +
+                p.h * 3600LL + p.mi * 60LL + p.sec - p.tz_offset_min * 60LL;
+            if (strcasecmp(field, "epochSeconds") == 0) {
+                sqlite3_result_int64(ctx, seconds + (seconds < 0 && p.ns >= 1000000));
+                return;
+            }
+            sqlite3_result_int64(ctx, seconds * 1000 + p.ns / 1000000);
             return;
         }
     }
@@ -3983,11 +3990,51 @@ void gql_temporal_diff_ns_func(
     sqlite3_result_int64(ctx, tb - ta);
 }
 
-/*
- * REGEXP function for SQLite
- * Implements the =~ operator from Cypher
- * Usage: regexp(pattern, string) returns 1 if string matches pattern, 0 otherwise
- */
+/* Reject Java constructs with a different valid meaning in PCRE2. Other
+ * unsupported constructs fail at compile time. Respect escapes and \Q...\E so
+ * literal text is not accidentally rejected. */
+static const char *regexp_unsupported_java(const char *pattern, size_t length) {
+    int in_class = 0, quoted = 0;
+    for (size_t i = 0; i < length; i++) {
+        if (pattern[i] == '\\' && i + 1 < length) {
+            if (pattern[i + 1] == 'Q' && !quoted) quoted = 1;
+            else if (pattern[i + 1] == 'E' && quoted) quoted = 0;
+            i++;
+            continue;
+        }
+        if (quoted) continue;
+        if (pattern[i] == '[') {
+            if (in_class) return "Java regex nested character classes are not supported";
+            in_class++;
+        }
+        else if (pattern[i] == ']' && in_class) in_class--;
+        if (in_class) {
+            if (pattern[i] == '&' && i + 1 < length && pattern[i + 1] == '&')
+                return "Java regex character-class intersection is not supported";
+            continue;
+        }
+        if (pattern[i] == '(' && i + 2 < length && pattern[i + 1] == '?') {
+            size_t j = i + 2;
+            while (j < length && ((pattern[j] >= 'a' && pattern[j] <= 'z') ||
+                                 (pattern[j] >= 'A' && pattern[j] <= 'Z') ||
+                                 pattern[j] == '-')) j++;
+            if (j > i + 2 && j < length && (pattern[j] == ')' || pattern[j] == ':')) {
+                for (size_t k = i + 2; k < j; k++)
+                    if (pattern[k] == 'd' || pattern[k] == 'u' || pattern[k] == 'U')
+                        return "Java regex flags d, u, and U are not supported";
+            }
+        }
+    }
+    return NULL;
+}
+
+static void regexp_free_code(void *code) {
+    pcre2_code_free((pcre2_code *)code);
+}
+
+/* Implements Cypher's =~ with whole-string matching. ENDANCHORED is passed
+ * into the engine (rather than checking the first result's length), allowing
+ * alternatives and lazy quantifiers to backtrack to a complete match. */
 void regexp_func(
     sqlite3_context *context,
     int argc,
@@ -3995,9 +4042,10 @@ void regexp_func(
 ) {
     const char *pattern;
     const char *string;
-    regex_t regex;
+    pcre2_code *code;
+    pcre2_match_data *match_data;
     int ret;
-    int cflags = REG_EXTENDED | REG_NOSUB;
+    int pattern_length, string_length;
 
     if (argc != 2) {
         graphqlite_result_error(context, "regexp() requires 2 arguments", GQL_ERR_VALIDATION);
@@ -4013,30 +4061,54 @@ void regexp_func(
         sqlite3_result_null(context);
         return;
     }
-
-    /* Check for (?i) flag at start of pattern for case-insensitive matching */
-    if (strncmp(pattern, "(?i)", 4) == 0) {
-        cflags |= REG_ICASE;
-        pattern += 4;  /* Skip the flag */
+    pattern_length = sqlite3_value_bytes(argv[0]);
+    string_length = sqlite3_value_bytes(argv[1]);
+    code = (pcre2_code *)sqlite3_get_auxdata(context, 0);
+    if (!code) {
+        const char *unsupported = regexp_unsupported_java(pattern, (size_t)pattern_length);
+        if (unsupported) {
+            graphqlite_result_error(context, unsupported, GQL_ERR_EXECUTION);
+            return;
+        }
+        int error_code;
+        PCRE2_SIZE error_offset;
+        code = pcre2_compile((PCRE2_SPTR)pattern, (PCRE2_SIZE)pattern_length,
+                             PCRE2_UTF | PCRE2_ALT_BSUX | PCRE2_ANCHORED | PCRE2_ENDANCHORED,
+                             &error_code, &error_offset, NULL);
+        if (!code) {
+            PCRE2_UCHAR detail[192];
+            char errbuf[256];
+            pcre2_get_error_message(error_code, detail, sizeof(detail));
+            snprintf(errbuf, sizeof(errbuf), "Invalid regex at byte %zu: %s",
+                     (size_t)error_offset, (const char *)detail);
+            for (char *p = errbuf; *p; p++) { if (*p == '"') *p = '\''; }
+            graphqlite_result_error(context, errbuf, GQL_ERR_EXECUTION);
+            return;
+        }
     }
-
-    /* Compile the regex */
-    ret = regcomp(&regex, pattern, cflags);
-    if (ret != 0) {
-        char errbuf[256];
-        regerror(ret, &regex, errbuf, sizeof(errbuf));
-        /* Sanitize double quotes in dynamic error message */
-        for (char *p = errbuf; *p; p++) { if (*p == '"') *p = '\''; }
-        graphqlite_result_error(context, errbuf, GQL_ERR_EXECUTION);
+    match_data = pcre2_match_data_create_from_pattern(code, NULL);
+    if (!match_data) {
+        /* The cache owns existing entries; new code is installed only after use. */
+        if (!sqlite3_get_auxdata(context, 0)) pcre2_code_free(code);
+        sqlite3_result_error_nomem(context);
         return;
     }
-
-    /* Execute the regex */
-    ret = regexec(&regex, string, 0, NULL, 0);
-    regfree(&regex);
-
-    /* Return result: 1 for match, 0 for no match */
-    sqlite3_result_int(context, ret == 0 ? 1 : 0);
+    ret = pcre2_match(code, (PCRE2_SPTR)string, (PCRE2_SIZE)string_length,
+                      0, 0, match_data, NULL);
+    pcre2_match_data_free(match_data);
+    /* sqlite3_set_auxdata may immediately free code, so do this after matching. */
+    if (!sqlite3_get_auxdata(context, 0))
+        sqlite3_set_auxdata(context, 0, code, regexp_free_code);
+    if (ret >= 0 || ret == PCRE2_ERROR_NOMATCH) {
+        sqlite3_result_int(context, ret >= 0);
+    } else {
+        PCRE2_UCHAR detail[192];
+        char errbuf[256];
+        pcre2_get_error_message(ret, detail, sizeof(detail));
+        snprintf(errbuf, sizeof(errbuf), "Regex match failed: %s", (const char *)detail);
+        for (char *p = errbuf; *p; p++) { if (*p == '"') *p = '\''; }
+        graphqlite_result_error(context, errbuf, GQL_ERR_EXECUTION);
+    }
 }
 
 /* Validate the AST the way the executor does before transform: the static
@@ -4514,4 +4586,232 @@ void cypher_capabilities_func(sqlite3_context *context, int argc, sqlite3_value 
     char *out = sqlite3_str_finish(s);
     if (!out) { sqlite3_result_error_nomem(context); return; }
     sqlite3_result_text(context, out, -1, sqlite3_free);
+}
+
+/* A private shortest-prefix distance oracle. The constant type-list argument
+ * owns its cache through SQLite auxdata: adjacency and BFS results cannot leak
+ * across statements or database connections. No path choices are made here;
+ * the recursive CTE still retains parallel edges and every shortest tie. */
+typedef struct gql_distance_row {
+    size_t source;
+    int *distance;
+    int cycle;
+    sqlite3_int64 *parent_edge;
+    sqlite3_int64 cycle_edge;
+    unsigned long long touched;
+} gql_distance_row;
+typedef struct gql_distance_cache {
+    sqlite3_int64 *ids;
+    size_t node_count;
+    size_t *offsets;
+    size_t *targets;
+    sqlite3_int64 *edge_ids;
+    size_t *queue;
+    gql_distance_row *rows;
+    size_t row_count;
+    size_t row_capacity;
+    int direction;
+    unsigned long long clock;
+} gql_distance_cache;
+typedef struct gql_distance_edge {
+    sqlite3_int64 id;
+    sqlite3_int64 source;
+    sqlite3_int64 target;
+} gql_distance_edge;
+
+static void gql_distance_free(void *pointer)
+{
+    gql_distance_cache *cache = pointer;
+    if (!cache) return;
+    for (size_t i = 0; i < cache->row_count; i++) {
+        free(cache->rows[i].distance);
+        free(cache->rows[i].parent_edge);
+    }
+    free(cache->rows);
+    free(cache->ids);
+    free(cache->offsets);
+    free(cache->targets);
+    free(cache->edge_ids);
+    free(cache->queue);
+    free(cache);
+}
+static int gql_distance_id_compare(const void *a, const void *b)
+{
+    sqlite3_int64 left = *(const sqlite3_int64 *)a;
+    sqlite3_int64 right = *(const sqlite3_int64 *)b;
+    return (left > right) - (left < right);
+}
+static size_t gql_distance_index(gql_distance_cache *cache, sqlite3_int64 id)
+{
+    sqlite3_int64 *found = bsearch(&id, cache->ids, cache->node_count,
+                                  sizeof(*cache->ids), gql_distance_id_compare);
+    return found ? (size_t)(found - cache->ids) : SIZE_MAX;
+}
+static gql_distance_cache *gql_distance_load(sqlite3 *db, const char *types,
+                                             int direction, int *result)
+{
+    gql_distance_cache *cache = calloc(1, sizeof(*cache));
+    gql_distance_edge *edges = NULL;
+    size_t count = 0, capacity = 0;
+    sqlite3_stmt *stmt = NULL;
+    int rc = SQLITE_NOMEM;
+    if (!cache) goto failed;
+    cache->direction = direction;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT source_id, target_id, id FROM edges WHERE json_array_length(?1) = 0 "
+        "OR type IN (SELECT value FROM json_each(?1))", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) goto failed;
+    rc = sqlite3_bind_text(stmt, 1, types, -1, SQLITE_TRANSIENT);
+    if (rc != SQLITE_OK) goto failed;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (count == capacity) {
+            size_t next = capacity ? capacity * 2 : 256;
+            if (next < capacity || next > SIZE_MAX / sizeof(*edges)) { rc = SQLITE_NOMEM; goto failed; }
+            gql_distance_edge *grown = realloc(edges, next * sizeof(*edges));
+            if (!grown) { rc = SQLITE_NOMEM; goto failed; }
+            edges = grown;
+            capacity = next;
+        }
+        edges[count].id = sqlite3_column_int64(stmt, 2);
+        edges[count].source = sqlite3_column_int64(stmt, direction == -1 ? 1 : 0);
+        edges[count].target = sqlite3_column_int64(stmt, direction == -1 ? 0 : 1);
+        count++;
+    }
+    if (rc != SQLITE_DONE) goto failed;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (count > SIZE_MAX / (2 * sizeof(*cache->ids))) { rc = SQLITE_NOMEM; goto failed; }
+    cache->ids = malloc((count ? count * 2 : 1) * sizeof(*cache->ids));
+    if (!cache->ids) { rc = SQLITE_NOMEM; goto failed; }
+    for (size_t i = 0; i < count; i++) {
+        cache->ids[2 * i] = edges[i].source;
+        cache->ids[2 * i + 1] = edges[i].target;
+    }
+    qsort(cache->ids, count * 2, sizeof(*cache->ids), gql_distance_id_compare);
+    for (size_t i = 0; i < count * 2; i++) {
+        if (!cache->node_count || cache->ids[i] != cache->ids[cache->node_count - 1])
+            cache->ids[cache->node_count++] = cache->ids[i];
+    }
+    if (cache->node_count > INT32_MAX) { rc = SQLITE_TOOBIG; goto failed; }
+    size_t n = cache->node_count;
+    cache->offsets = calloc(n + 1, sizeof(*cache->offsets));
+    cache->targets = malloc((count ? count : 1) * sizeof(*cache->targets));
+    cache->edge_ids = malloc((count ? count : 1) * sizeof(*cache->edge_ids));
+    cache->queue = malloc((n ? n : 1) * sizeof(*cache->queue));
+    if (!cache->offsets || !cache->targets || !cache->edge_ids || !cache->queue) { rc = SQLITE_NOMEM; goto failed; }
+    for (size_t i = 0; i < count; i++) cache->offsets[gql_distance_index(cache, edges[i].source) + 1]++;
+    for (size_t i = 1; i <= n; i++) cache->offsets[i] += cache->offsets[i - 1];
+    size_t *cursor = calloc(n ? n : 1, sizeof(*cursor));
+    if (!cursor) { rc = SQLITE_NOMEM; goto failed; }
+    if (n) memcpy(cursor, cache->offsets, n * sizeof(*cursor));
+    for (size_t i = 0; i < count; i++) {
+        size_t source = gql_distance_index(cache, edges[i].source);
+        cache->edge_ids[cursor[source]] = edges[i].id;
+        cache->targets[cursor[source]++] = gql_distance_index(cache, edges[i].target);
+    }
+    free(cursor);
+    free(edges);
+    /* Bound per-statement distance storage to 64 MiB. Small graphs can cache
+     * all source rows; larger graphs use LRU eviction without changing results. */
+    cache->row_capacity = n ? (64 * 1024 * 1024) / (n * (sizeof(int) + sizeof(sqlite3_int64)) + sizeof(gql_distance_row)) : 1;
+    if (!cache->row_capacity) cache->row_capacity = 1;
+    if (n && cache->row_capacity > n) cache->row_capacity = n;
+    cache->rows = calloc(cache->row_capacity, sizeof(*cache->rows));
+    if (!cache->rows) { rc = SQLITE_NOMEM; edges = NULL; goto failed; }
+    *result = SQLITE_OK;
+    return cache;
+failed:
+    sqlite3_finalize(stmt);
+    free(edges);
+    gql_distance_free(cache);
+    *result = rc;
+    return NULL;
+}
+static gql_distance_row *gql_distance_bfs(gql_distance_cache *cache, size_t source)
+{
+    for (size_t i = 0; i < cache->row_count; i++) {
+        if (cache->rows[i].source == source) {
+            cache->rows[i].touched = ++cache->clock;
+            return &cache->rows[i];
+        }
+    }
+    size_t slot = cache->row_count;
+    if (slot == cache->row_capacity) {
+        slot = 0;
+        for (size_t i = 1; i < cache->row_count; i++)
+            if (cache->rows[i].touched < cache->rows[slot].touched) slot = i;
+    } else {
+        cache->rows[slot].distance = malloc(cache->node_count * sizeof(int));
+        cache->rows[slot].parent_edge = malloc(cache->node_count * sizeof(sqlite3_int64));
+        if (!cache->rows[slot].distance || !cache->rows[slot].parent_edge) {
+            free(cache->rows[slot].distance);
+            free(cache->rows[slot].parent_edge);
+            return NULL;
+        }
+        cache->row_count++;
+    }
+    gql_distance_row *row = &cache->rows[slot];
+    row->source = source;
+    row->cycle = -1;
+    row->cycle_edge = -1;
+    row->touched = ++cache->clock;
+    for (size_t i = 0; i < cache->node_count; i++) {
+        row->distance[i] = -1;
+        row->parent_edge[i] = -1;
+    }
+    row->distance[source] = 0;
+    size_t head = 0, tail = 0;
+    cache->queue[tail++] = source;
+    while (head < tail) {
+        size_t current = cache->queue[head++];
+        int next_distance = row->distance[current] + 1;
+        for (size_t e = cache->offsets[current]; e < cache->offsets[current + 1]; e++) {
+            size_t target = cache->targets[e];
+            if (target == source && (row->cycle < 0 || next_distance < row->cycle)) {
+                row->cycle = next_distance;
+                row->cycle_edge = cache->edge_ids[e];
+            }
+            if (row->distance[target] >= 0) continue;
+            row->distance[target] = next_distance;
+            row->parent_edge[target] = cache->edge_ids[e];
+            cache->queue[tail++] = target;
+        }
+    }
+    return row;
+}
+void gql_shortest_prefix_func(sqlite3_context *context, int argc, sqlite3_value **argv)
+{
+    if (argc != 7 || sqlite3_value_type(argv[0]) == SQLITE_NULL || sqlite3_value_type(argv[1]) == SQLITE_NULL) {
+        sqlite3_result_null(context);
+        return;
+    }
+    int direction = sqlite3_value_int(argv[5]);
+    if (direction != 1 && direction != -1) {
+        sqlite3_result_error(context, "shortest distance requires directed traversal", -1);
+        return;
+    }
+    gql_distance_cache *cache = sqlite3_get_auxdata(context, 4);
+    bool loaded = !cache || cache->direction != direction;
+    if (loaded) {
+        int rc;
+        const char *types = (const char *)sqlite3_value_text(argv[4]);
+        cache = gql_distance_load(sqlite3_context_db_handle(context), types ? types : "[]", direction, &rc);
+        if (!cache) { sqlite3_result_error_code(context, rc); return; }
+    }
+    size_t source = gql_distance_index(cache, sqlite3_value_int64(argv[0]));
+    size_t target = gql_distance_index(cache, sqlite3_value_int64(argv[1]));
+    if (source == SIZE_MAX || target == SIZE_MAX) {
+        sqlite3_result_int(context, 0);
+    } else {
+        gql_distance_row *row = gql_distance_bfs(cache, source);
+        if (!row) sqlite3_result_error_nomem(context);
+        else {
+            int distance = source == target ? row->cycle : row->distance[target];
+            sqlite3_int64 parent = source == target ? row->cycle_edge : row->parent_edge[target];
+            sqlite3_result_int(context, sqlite3_value_int(argv[3]) <= distance &&
+                (!sqlite3_value_int(argv[6]) || sqlite3_value_int64(argv[2]) == parent));
+        }
+    }
+    /* set_auxdata can immediately call the destructor; never access afterward. */
+    if (loaded) sqlite3_set_auxdata(context, 4, cache, gql_distance_free);
 }

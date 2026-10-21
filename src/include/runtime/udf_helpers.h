@@ -73,6 +73,9 @@ void gql_normalize_time_func(sqlite3_context *ctx, int argc, sqlite3_value **arg
 void gql_normalize_datetime_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 void gql_temporal_diff_ns_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 
+/* Directed shortest-prefix distance, with a per-statement BFS cache. */
+void gql_shortest_prefix_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+
 /* Regex + Cypher reflection */
 void regexp_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 void cypher_validate_func(sqlite3_context *context, int argc, sqlite3_value **argv);

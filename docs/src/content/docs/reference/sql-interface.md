@@ -97,6 +97,18 @@ The first byte distinguishes the two shapes: `[` is a result set, `{` is a stati
 
 ---
 
+### `cypher_result(query [, params_json])`
+
+Returns `{"columns":[...],"rows":[...]}` with column names in projection order,
+including for empty results. Values use the same typed JSON representation as
+`cypher_rows`. This is useful for drivers that must distinguish an empty result
+with a known schema from a query with no projection. Writes without `RETURN`
+produce one statistics row, as with `cypher_rows`.
+
+```sql
+SELECT cypher_result('MATCH (u:User) RETURN u.name AS name, u.objectid AS id');
+```
+
 ### `cypher_rows(query [, params_json])` (table-valued)
 
 ```sql
@@ -179,7 +191,23 @@ SELECT regexp('^Al.*', 'Alice');   -- 1
 SELECT regexp('^Al.*', 'Bob');     -- 0
 ```
 
-POSIX extended regular expression (ERE) match. Used internally to implement the `=~` operator. Returns `1` if `string` matches `pattern`, `0` otherwise. The `(?i)` prefix enables case-insensitive matching.
+Whole-string regular expression match using the statically bundled PCRE2
+interpreter. Used internally to implement Cypher's `=~` operator. Returns `1`
+only when the entire string matches, `0` otherwise, and `NULL` if either argument
+is `NULL`. Use `.*term.*` for a substring search. Invalid patterns and matching
+resource-limit errors are reported as errors, not as non-matches.
+
+Supports UTF-8 strings, common inline flags (`i`, `m`, `s`, `x`, including scoped
+flags), lookahead, lookbehind, named captures, backreferences, and `\Q...\E`
+quoting. Shorthand classes such as `\w` and `\d` use ASCII semantics by default.
+This is the common Java/PCRE syntax subset, not the complete Java regex dialect:
+Java-only `d`, `u`, and `U` flags, character-class intersection and nested
+character classes are rejected explicitly. Java-specific property names such as
+`\p{javaLowerCase}` also produce errors. Unicode case folding and newline rules
+follow PCRE2 and can differ from Java for non-ASCII case-insensitive patterns and
+non-LF line terminators. See [operator semantics](./cypher-operators/) for
+examples. The separate `apoc.text.replace` function retains its documented POSIX
+regex behavior.
 
 **Arguments**
 

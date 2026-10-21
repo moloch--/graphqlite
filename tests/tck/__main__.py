@@ -79,7 +79,9 @@ def main(argv: list[str] | None = None) -> int:
 
     for b in backends:
         b.close()
-    return 0
+    # The JSON report remains available for diagnosis, but a completed run
+    # containing failures/errors must fail the command and its CI gate.
+    return 1 if any(o.status in ("fail", "error") for o in outcomes) else 0
 
 
 def _select_backends(name: str, debug: bool):

@@ -212,9 +212,21 @@ RUNTIME_OBJS = $(RUNTIME_SRCS:$(RUNTIME_DIR)/%.c=$(BUILD_RUNTIME_DIR)/%.o)
 RUNTIME_OBJS_COV = $(RUNTIME_SRCS:$(RUNTIME_DIR)/%.c=$(BUILD_RUNTIME_DIR)/%.cov.o)
 RUNTIME_OBJS_PIC = $(RUNTIME_SRCS:$(RUNTIME_DIR)/%.c=$(BUILD_RUNTIME_DIR)/%.pic.o)
 
+# PCRE2 is compiled into each artifact, never loaded from the host system.
+# Keep sources pinned and reproducibly vendored; see vendor/pcre2/README.md.
+PCRE2_DIR = vendor/pcre2
+PCRE2_SRCS = $(wildcard $(PCRE2_DIR)/*.c)
+PCRE2_HEADERS = $(wildcard $(PCRE2_DIR)/*.h) $(PCRE2_DIR)/config.h.generic
+PCRE2_OBJS = $(PCRE2_SRCS:$(PCRE2_DIR)/%.c=$(BUILD_DIR)/pcre2/%.o)
+PCRE2_CFLAGS = -O2 -fPIC -fvisibility=hidden -DPCRE2_CODE_UNIT_WIDTH=8 -DHAVE_CONFIG_H -DPCRE2_STATIC -I$(PCRE2_DIR)
+RUNTIME_OBJS += $(PCRE2_OBJS)
+RUNTIME_OBJS_COV += $(PCRE2_OBJS)
+RUNTIME_OBJS_PIC += $(PCRE2_OBJS)
+
 # Test sources
 TEST_SRCS = \
 	$(TEST_DIR)/test_runner.c \
+	$(TEST_DIR)/test_regex.c \
 	$(TEST_DIR)/test_parser_keywords.c \
 	$(TEST_DIR)/test_scanner.c \
 	$(TEST_DIR)/test_parser.c \
@@ -466,14 +478,20 @@ $(BUILD_EXECUTOR_DIR)/%.pic.o: $(EXECUTOR_DIR)/%.c | dirs
 	$(CC) $(EXTENSION_CFLAGS_BASE) $(EXTENSION_CFLAGS) -fPIC -c $< -o $@
 
 # Runtime objects
+$(BUILD_DIR)/pcre2/%.o: $(PCRE2_DIR)/%.c $(PCRE2_HEADERS)
+	@mkdir -p $(BUILD_DIR)/pcre2
+	$(CC) $(PCRE2_CFLAGS) -c $< -o $@
+
+$(BUILD_RUNTIME_DIR)/udf_helpers.o $(BUILD_RUNTIME_DIR)/udf_helpers.cov.o $(BUILD_RUNTIME_DIR)/udf_helpers.pic.o: $(PCRE2_DIR)/pcre2.h
+
 $(BUILD_RUNTIME_DIR)/%.o: $(RUNTIME_DIR)/%.c | dirs
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -I$(PCRE2_DIR) -c $< -o $@
 
 $(BUILD_RUNTIME_DIR)/%.cov.o: $(RUNTIME_DIR)/%.c | dirs
-	$(CC) $(CFLAGS) $(COVERAGE_FLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(COVERAGE_FLAGS) -I$(PCRE2_DIR) -c $< -o $@
 
 $(BUILD_RUNTIME_DIR)/%.pic.o: $(RUNTIME_DIR)/%.c | dirs
-	$(CC) $(EXTENSION_CFLAGS_BASE) $(EXTENSION_CFLAGS) -fPIC -c $< -o $@
+	$(CC) $(EXTENSION_CFLAGS_BASE) $(EXTENSION_CFLAGS) -fPIC -I$(PCRE2_DIR) -c $< -o $@
 
 # Test objects
 $(BUILD_TEST_DIR)/%.o: $(TEST_DIR)/%.c $(GRAMMAR_HDR) | dirs

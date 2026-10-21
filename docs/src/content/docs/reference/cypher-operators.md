@@ -111,7 +111,14 @@ WHERE (n.a = 1) XOR (n.b = 1)
 | Regex match | `s =~ pattern` | PCRE regex; full-string match | `n.name =~ 'Al.*'` |
 | Concatenation | `s1 + s2` | Join two strings | `n.first + ' ' + n.last` |
 
-All string operators are case-sensitive. `=~` uses PCRE syntax via the `regexp()` SQL function registered by the extension.
+All string operators are case-sensitive by default. `=~` uses the bundled PCRE2
+interpreter via `regexp()` and requires a match of the entire string. Inline
+flags such as `(?i)` change matching options. Lookarounds, captures and
+backreferences are supported; Java-only flags `d`, `u`, `U` and nested or
+intersecting character classes are rejected rather than reinterpreted. Unicode
+case folding and newline rules follow PCRE2 rather than full Java dialect
+semantics. See [regexp](./sql-interface/#regexppattern-string) for the supported
+subset and error behavior.
 
 **Examples**
 

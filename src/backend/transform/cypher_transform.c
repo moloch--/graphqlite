@@ -14,6 +14,7 @@
 #include "parser/cypher_debug.h"
 
 #include "runtime/udf_register.h"
+#include "runtime/gql_error.h"
 
 /* Initial buffer sizes */
 #define INITIAL_SQL_BUFFER_SIZE 1024
@@ -199,6 +200,8 @@ void cypher_transform_free_context(cypher_transform_context *ctx)
         free(ctx->optional_defer_pairs[i].endpoint_col);
     }
     free(ctx->optional_defer_pairs);
+    for (int i = 0; i < ctx->varlen_bindings_count; i++) free(ctx->varlen_bindings[i].alias);
+    free(ctx->varlen_bindings);
 
     free(ctx);
 }
@@ -706,9 +709,19 @@ int cypher_transform_read_query_sql(cypher_transform_context *ctx, cypher_query 
             return -1;
         }
     }
-    if (ctx->unified_builder &&
-        (ctx->unified_builder->select_count > 0 ||
-         !dbuf_is_empty(&ctx->unified_builder->from))) {
+    if (ctx->unified_builder) {
+        /* A correlated MATCH can consist entirely of JOINs and predicates:
+         * its first node belongs to the outer query and must not be scanned
+         * again. Give those JOINs a one-row source, and project a constant
+         * when EXISTS has no explicit RETURN. Otherwise a variable-length
+         * MATCH without RETURN can emit only its WITH RECURSIVE prefix. */
+        if (dbuf_is_empty(&ctx->unified_builder->from) &&
+            !dbuf_is_empty(&ctx->unified_builder->joins)) {
+            sql_from(ctx->unified_builder, "(SELECT 1)", "_exists_seed");
+        }
+        if (ctx->unified_builder->select_count == 0) {
+            sql_select(ctx->unified_builder, "1", NULL);
+        }
         if (finalize_sql_generation(ctx) < 0) {
             ctx->has_error = true;
             free(ctx->error_message);
@@ -1316,7 +1329,7 @@ int cypher_transform_generate_sql(cypher_transform_context *ctx, cypher_query *q
  *     -- Base case: direct edges
  *     SELECT e.source_id, e.target_id, 1,
  *            CAST(e.source_id || ',' || e.target_id AS TEXT),
- *            ',' || e.source_id || ',' || e.target_id || ','
+ *            ',' || e.id || ','
  *     FROM edges e
  *     WHERE e.type = 'TYPE'  -- if type specified
  *
@@ -1325,17 +1338,57 @@ int cypher_transform_generate_sql(cypher_transform_context *ctx, cypher_query *q
  *     -- Recursive case: extend paths
  *     SELECT cte.start_id, e.target_id, cte.depth + 1,
  *            cte.path_ids || ',' || e.target_id,
- *            cte.visited || e.target_id || ','
+ *            cte.visited || e.id || ','
  *     FROM varlen_cte_N cte
  *     JOIN edges e ON e.source_id = cte.end_id
  *     WHERE cte.depth < max_hops
- *       AND cte.visited NOT LIKE '%,' || e.target_id || ',%'  -- cycle prevention
+ *       AND cte.visited NOT LIKE '%,' || e.id || ',%'  -- relationship uniqueness
  *       AND e.type = 'TYPE'  -- if type specified
  * )
  */
+/* Exact BFS distances prune non-shortest prefixes. shortestPath additionally
+ * follows one BFS parent per endpoint; allShortestPaths retains every tie. */
+static int append_shortest_prune(dynamic_buffer *query, cypher_rel_pattern *rel,
+                                const char *shortest_alias, bool single_shortest,
+                                const char *start_ref, const char *tgt_col,
+                                const char *depth_ref)
+{
+        dynamic_buffer types;
+        dbuf_init(&types);
+        dbuf_append(&types, "[");
+        if (rel->type) {
+            char *quoted = gql_json_quote(rel->type);
+            if (!quoted) { dbuf_free(&types); return -1; }
+            dbuf_append(&types, quoted);
+            free(quoted);
+        } else if (rel->types) {
+            for (int i = 0; i < rel->types->count; i++) {
+                cypher_literal *lit = (cypher_literal *)rel->types->items[i];
+                char *quoted = gql_json_quote(lit->value.string);
+                if (!quoted) { dbuf_free(&types); return -1; }
+                if (i) dbuf_append(&types, ",");
+                dbuf_append(&types, quoted);
+                free(quoted);
+            }
+        }
+        dbuf_append(&types, "]");
+        char *escaped = escape_sql_string(dbuf_get(&types));
+        if (!escaped) { dbuf_free(&types); return -1; }
+        dbuf_appendf(query,
+            " /*_gql_prune_begin_%s*/ AND "
+            "_gql_shortest_prefix(%s, e.%s, e.id, %s, '%s', %d, %d) /*_gql_prune_end_%s*/",
+            shortest_alias, start_ref, tgt_col, depth_ref, escaped,
+            rel->left_arrow && !rel->right_arrow ? -1 : 1, single_shortest ? 1 : 0, shortest_alias);
+        free(escaped);
+        dbuf_free(&types);
+    return 0;
+}
+
 int generate_varlen_cte(cypher_transform_context *ctx, cypher_rel_pattern *rel,
                        const char *source_alias, const char *target_alias,
-                       const char *cte_name, const char *anchor_ids_sql)
+                       const char *cte_name, const char *anchor_ids_sql,
+                       const char *shortest_alias, bool single_shortest,
+                       const char *bound_edge_ids_sql)
 {
     (void)source_alias; /* Mark as intentionally unused for now */
     (void)target_alias; /* Mark as intentionally unused for now */
@@ -1348,7 +1401,10 @@ int generate_varlen_cte(cypher_transform_context *ctx, cypher_rel_pattern *rel,
     /* min_hops == -1 means unspecified → default to 1. Explicit 0 must be
      * preserved so the zero-hop case (`(a)-[*0]->(b)` ⇒ a = b) works. */
     int min_hops = range->min_hops >= 0 ? range->min_hops : 1;
-    int max_hops = range->max_hops > 0 ? range->max_hops : 100; /* Default max for unbounded */
+    /* An omitted upper bound is genuinely unbounded. Relationship uniqueness
+     * below guarantees termination on a finite graph; a hidden hop ceiling
+     * would silently discard valid paths. Explicit zero stays zero. */
+    int max_hops = range->max_hops;
 
     CYPHER_DEBUG("Generating varlen CTE %s: min=%d, max=%d, type=%s",
                  cte_name, min_hops, max_hops, rel->type ? rel->type : "<any>");
@@ -1429,6 +1485,13 @@ int generate_varlen_cte(cypher_transform_context *ctx, cypher_rel_pattern *rel,
             }
         }
     }
+    /* A projected relationship list can only use its supplied edges. The
+     * union over its source CTE is a safe prefilter; the outer match still
+     * checks the exact ordered list for each individual binding. */
+    if (bound_edge_ids_sql) {
+        if (!dbuf_is_empty(&tpred)) dbuf_append(&tpred, " AND ");
+        dbuf_appendf(&tpred, "e.id IN (%s)", bound_edge_ids_sql);
+    }
     bool have_tpred = (dbuf_len(&tpred) > 0);
 
     /* The `visited` column tracks traversed EDGE ids (not node ids):
@@ -1473,6 +1536,17 @@ int generate_varlen_cte(cypher_transform_context *ctx, cypher_rel_pattern *rel,
         }
     }
 
+    if (shortest_alias && single_shortest) {
+        /* The base query may have neither a type nor an anchor predicate. */
+        if (!have_tpred && !anchor_ids_sql) dbuf_append(&cte_query, " WHERE 1=1");
+        char start_ref[32];
+        snprintf(start_ref, sizeof(start_ref), "e.%s", src_col);
+        if (append_shortest_prune(&cte_query, rel, shortest_alias, true,
+                                 start_ref, tgt_col, "1") < 0) {
+            dbuf_free(&tpred); dbuf_free(&cte_query); return -1;
+        }
+    }
+
     /* Undirected: emit the reverse-orientation base case too, so each
      * edge seeds a walk in both directions. */
     if (undirected) {
@@ -1487,11 +1561,11 @@ int generate_varlen_cte(cypher_transform_context *ctx, cypher_rel_pattern *rel,
             tgt_col, src_col,
             tgt_col, src_col);
         {
-            bool need_where = true;
-            if (have_tpred) { dbuf_appendf(&cte_query, " WHERE %s", dbuf_get(&tpred)); need_where = false; }
+            dbuf_append(&cte_query, " WHERE e.source_id <> e.target_id");
+            if (have_tpred) dbuf_appendf(&cte_query, " AND %s", dbuf_get(&tpred));
             if (anchor_ids_sql) {
                 /* Reverse orientation: the walk starts at the edge's other end. */
-                dbuf_appendf(&cte_query, "%s e.%s IN (%s)", need_where ? " WHERE" : " AND", tgt_col, anchor_ids_sql);
+                dbuf_appendf(&cte_query, " AND e.%s IN (%s)", tgt_col, anchor_ids_sql);
             }
         }
     }
@@ -1504,8 +1578,7 @@ int generate_varlen_cte(cypher_transform_context *ctx, cypher_rel_pattern *rel,
         /* Undirected step: join any edge incident to the current end
          * node and advance to its OTHER endpoint. The "other endpoint"
          * is `target_id` when we entered via `source_id`, else
-         * `source_id`. Node-based cycle prevention (matches the
-         * directed path's behavior). */
+         * `source_id`. Relationship uniqueness matches directed traversal. */
         const char *other =
             "(CASE WHEN e.source_id = cte.end_id THEN e.target_id ELSE e.source_id END)";
         dbuf_appendf(&cte_query,
@@ -1515,10 +1588,9 @@ int generate_varlen_cte(cypher_transform_context *ctx, cypher_rel_pattern *rel,
             "cte.elem_ids || ',' || e.id || ',' || %s "
             "FROM %s cte "
             "JOIN edges e ON (e.source_id = cte.end_id OR e.target_id = cte.end_id) "
-            "WHERE cte.depth >= 1 AND cte.depth < %d",
+            "WHERE cte.depth >= 1",
             other, other, other,
-            cte_name,
-            max_hops);
+            cte_name);
         /* Relationship-uniqueness: don't reuse an edge already on the path. */
         dbuf_append(&cte_query,
             " AND cte.visited NOT LIKE '%,' || CAST(e.id AS TEXT) || ',%'");
@@ -1530,15 +1602,21 @@ int generate_varlen_cte(cypher_transform_context *ctx, cypher_rel_pattern *rel,
             "cte.elem_ids || ',' || e.id || ',' || e.%s "
             "FROM %s cte "
             "JOIN edges e ON e.%s = cte.end_id "
-            "WHERE cte.depth >= 1 AND cte.depth < %d",
+            "WHERE cte.depth >= 1",
             tgt_col, tgt_col, tgt_col,
             cte_name,
-            src_col,
-            max_hops);
+            src_col);
         /* Relationship-uniqueness: don't reuse an edge already on the path. */
         dbuf_append(&cte_query,
             " AND cte.visited NOT LIKE '%,' || CAST(e.id AS TEXT) || ',%'");
     }
+
+    if (shortest_alias && append_shortest_prune(&cte_query, rel, shortest_alias,
+            single_shortest, "cte.start_id", tgt_col, "cte.depth + 1") < 0) {
+        dbuf_free(&tpred); dbuf_free(&cte_query); return -1;
+    }
+
+    if (max_hops >= 0) dbuf_appendf(&cte_query, " AND cte.depth < %d", max_hops);
 
     /* Add type constraint to recursive case */
     if (have_tpred) dbuf_appendf(&cte_query, " AND %s", dbuf_get(&tpred));
