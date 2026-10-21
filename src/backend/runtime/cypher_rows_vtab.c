@@ -432,10 +432,62 @@ static sqlite3_module cypher_rows_module = {
 
 typedef struct { gql_executor_getter getter; void *arg; } rows_registration;
 
+/* A result envelope retains the projection schema even when no rows match.
+ * Reuse the table renderer so typed cells and column naming cannot drift. */
+static void cypher_result_envelope(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    rows_registration *reg = sqlite3_user_data(context);
+    if (argc < 1 || argc > 2) {
+        sqlite3_result_error(context, "cypher_result() requires (query [, params_json])", -1);
+        return;
+    }
+    rows_vtab vt = {0};
+    vt.getter = reg->getter;
+    vt.getter_arg = reg->arg;
+    rows_cursor cursor = {0};
+    cursor.base.pVtab = &vt.base;
+    cursor.row_json_for = -1;
+    int rc = rows_filter(&cursor.base, 0, NULL, argc, argv);
+    if (rc != SQLITE_OK) {
+        sqlite3_result_error(context, vt.base.zErrMsg ? vt.base.zErrMsg : "Cypher execution failed", -1);
+        sqlite3_free(vt.base.zErrMsg);
+        cursor_reset(&cursor);
+        return;
+    }
+    gbuf output = {0};
+    char *columns = render_cols_json(&cursor);
+    if (!columns || gb_puts(&output, "{\"columns\":") < 0 ||
+        gb_puts(&output, columns) < 0 || gb_puts(&output, ",\"rows\":[") < 0) goto oom;
+    free(columns);
+    columns = NULL;
+    for (cursor.row = 0; cursor.row < cursor.nrows; cursor.row++) {
+        char *row = render_row_json(&cursor);
+        if (!row) goto oom;
+        rc = ((cursor.row && gb_putc(&output, ',') < 0) || gb_puts(&output, row) < 0) ? SQLITE_NOMEM : SQLITE_OK;
+        free(row);
+        if (rc != SQLITE_OK) goto oom;
+    }
+    if (gb_puts(&output, "]}") < 0) goto oom;
+    sqlite3_result_text(context, output.p, -1, free);
+    cursor_reset(&cursor);
+    return;
+oom:
+    free(columns);
+    free(output.p);
+    cursor_reset(&cursor);
+    sqlite3_result_error_nomem(context);
+}
+
 int graphqlite_register_cypher_rows(sqlite3 *db, gql_executor_getter getter, void *getter_arg) {
     rows_registration *reg = sqlite3_malloc(sizeof(rows_registration));
     if (!reg) return SQLITE_NOMEM;
     reg->getter = getter;
     reg->arg = getter_arg;
-    return sqlite3_create_module_v2(db, "cypher_rows", &cypher_rows_module, reg, sqlite3_free);
+    int rc = sqlite3_create_module_v2(db, "cypher_rows", &cypher_rows_module, reg, sqlite3_free);
+    if (rc != SQLITE_OK) return rc;
+    rows_registration *envelope = sqlite3_malloc(sizeof(rows_registration));
+    if (!envelope) return SQLITE_NOMEM;
+    envelope->getter = getter;
+    envelope->arg = getter_arg;
+    return sqlite3_create_function_v2(db, "cypher_result", -1, SQLITE_UTF8, envelope,
+                                     cypher_result_envelope, NULL, NULL, sqlite3_free);
 }

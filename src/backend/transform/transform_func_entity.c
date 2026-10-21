@@ -144,6 +144,16 @@ int transform_labels_function(cypher_transform_context *ctx, cypher_function_cal
         return -1;
     }
 
+    /* List predicates/comprehensions carry nodes(p) elements as entity JSON,
+     * not as EAV node ids. Resolve these dynamically, just like list[0].
+     * Known entity aliases from WITH/UNWIND still use the id lookup below. */
+    bool is_projected = transform_var_is_projected(ctx->var_ctx, id->name);
+    bool alias_is_id = transform_var_alias_is_id(ctx->var_ctx, id->name);
+    if (is_projected && !alias_is_id) {
+        append_sql(ctx, "_gql_labels(%s)", alias);
+        return 0;
+    }
+
     /* Multi-graph support: get graph prefix for table references */
     const char *graph = transform_var_get_graph(ctx->var_ctx, id->name);
     const char *gprefix = "";
@@ -159,12 +169,11 @@ int transform_labels_function(cypher_transform_context *ctx, cypher_function_cal
      * `json('[]')` — `json_group_array` over an empty result set
      * yields NULL in SQLite, but Cypher spec says labels() on a
      * label-less node returns []. T-0325. */
-    bool is_projected = transform_var_is_projected(ctx->var_ctx, id->name);
     append_sql(ctx,
         "(CASE WHEN %s%s IS NULL THEN NULL ELSE "
         "COALESCE((SELECT json_group_array(label) FROM %snode_labels WHERE node_id = %s%s), json('[]')) END)",
-        alias, is_projected ? "" : ".id",
-        gprefix, alias, is_projected ? "" : ".id");
+        alias, (is_projected || alias_is_id) ? "" : ".id",
+        gprefix, alias, (is_projected || alias_is_id) ? "" : ".id");
 
     return 0;
 }

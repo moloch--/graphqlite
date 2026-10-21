@@ -359,6 +359,20 @@ static bool with_append_tag(dynamic_buffer *col_buf, char *tag_sql, const char *
     return true;
 }
 
+/* A variable-length relationship binds a list, even though its pre-WITH
+ * storage variable uses VAR_KIND_EDGE to refer to the recursive CTE. It has
+ * elem_ids/visited columns rather than a single edge id. */
+static bool with_varlen_list(const transform_var *var)
+{
+    return var && var->kind == VAR_KIND_EDGE && var->cte_name && !var->alias_is_id;
+}
+
+static void with_append_json_tag(dynamic_buffer *columns, const char *name)
+{
+    char tag_column[320];
+    dbuf_appendf(columns, ", 'json' AS %s", with_tag_col(tag_column, sizeof(tag_column), name));
+}
+
 int transform_with_clause(cypher_transform_context *ctx, cypher_with *with)
 {
     CYPHER_DEBUG("Transforming WITH clause");
@@ -512,6 +526,40 @@ int transform_with_clause(cypher_transform_context *ctx, cypher_with *with)
                 dbuf_append(&group_buf, ", ");
             }
 
+            if (with_varlen_list(var) || var->kind == VAR_KIND_PATH) {
+                cypher_identifier id = {0};
+                id.base.type = AST_NODE_IDENTIFIER;
+                id.name = var->name;
+                char *value = transform_expression_to_string(ctx, (ast_node *)&id);
+                if (!value) {
+                    dbuf_free(&col_buf); dbuf_free(&group_buf); free(saved_cte);
+                    free(saved_raw); free(with_where_pre);
+                    for (int t = 0; t < star_tagged_n; t++) free(star_tagged[t]);
+                    return -1;
+                }
+                char idbuf[128];
+                dbuf_appendf(&col_buf, "%s AS %s", value,
+                             sql_ident(idbuf, sizeof(idbuf), var->name));
+                dbuf_append(&group_buf, value);
+                free(value);
+                if (with_varlen_list(var) && star_tagged_n < 256) {
+                    char *tagged_name = strdup(var->name);
+                    if (!tagged_name) {
+                        dbuf_free(&col_buf); dbuf_free(&group_buf); free(saved_cte);
+                        free(saved_raw); free(with_where_pre);
+                        for (int t = 0; t < star_tagged_n; t++) free(star_tagged[t]);
+                        ctx->has_error = true;
+                        ctx->error_message = strdup("Memory allocation failed in WITH list projection");
+                        return -1;
+                    }
+                    with_append_json_tag(&col_buf, var->name);
+                    star_tagged[star_tagged_n++] = tagged_name;
+                }
+                group_count++;
+                added++;
+                continue;
+            }
+
             bool is_projected = (var->kind == VAR_KIND_PROJECTED);
             bool skip_id = var->alias_is_id || is_projected;
             const char *id_suffix = skip_id ? "" : ".id";
@@ -546,16 +594,26 @@ int transform_with_clause(cypher_transform_context *ctx, cypher_with *with)
         /* Get the expression as SQL */
         if (item->expr->type == AST_NODE_IDENTIFIER) {
             cypher_identifier *id = (cypher_identifier*)item->expr;
+            bool varlen_list = with_varlen_list(transform_var_lookup(ctx->var_ctx, id->name));
             /* I-0047 P4: a path variable has no table alias; emit its
              * hydration SQL (transform_expression handles path vars, building
              * `'[' || …ids… ']'`) AS the column so the path survives the WITH
              * boundary. Without this it fell through to a bare `p` column →
              * "no such column: p" (With1 [4]). The post-CTE registration maps
              * the path var to a projected `_with_N.p` for the outer scope. */
-            if (transform_var_is_path(ctx->var_ctx, id->name)) {
+            if (varlen_list || transform_var_is_path(ctx->var_ctx, id->name)) {
                 const char *col_name = item->alias ? item->alias : id->name;
                 char *psql = transform_expression_to_string(ctx, item->expr);
                 char idbuf[128];
+                if (varlen_list && (!psql || !psql[0])) {
+                    free(psql); dbuf_free(&col_buf); dbuf_free(&group_buf);
+                    free(saved_cte); free(saved_raw); free(with_where_pre);
+                    if (!ctx->has_error) {
+                        ctx->has_error = true;
+                        ctx->error_message = strdup("Failed to project variable-length relationship list");
+                    }
+                    return -1;
+                }
                 if (psql && psql[0]) {
                     dbuf_appendf(&col_buf, "%s AS %s", psql,
                                  sql_ident(idbuf, sizeof(idbuf), col_name));
@@ -565,6 +623,10 @@ int transform_with_clause(cypher_transform_context *ctx, cypher_with *with)
                 } else {
                     dbuf_appendf(&col_buf, "'[]' AS %s",
                                  sql_ident(idbuf, sizeof(idbuf), col_name));
+                }
+                if (varlen_list && i < 256) {
+                    with_append_json_tag(&col_buf, col_name);
+                    item_tagged[i] = true;
                 }
                 free(psql);
                 continue;
@@ -973,6 +1035,7 @@ with_star_columns_done:
     int saved_var_count = 0;
     char **saved_var_names = NULL;
     var_kind *saved_var_kinds = NULL;
+    var_kind *saved_var_inner_kinds = NULL;
     /* I-0047 P4: preserve path-variable metadata (elements + type) across the
      * var-ctx reset so a forwarded path var (`MATCH p=… WITH p …`) can be
      * re-registered as a path pointing at the CTE column, and the executor
@@ -985,21 +1048,51 @@ with_star_columns_done:
         int total_vars = transform_var_count(ctx->var_ctx);
         saved_var_names = calloc(total_vars, sizeof(char*));
         saved_var_kinds = calloc(total_vars, sizeof(var_kind));
-        if (saved_var_names && saved_var_kinds) {
+        saved_var_inner_kinds = calloc(total_vars, sizeof(var_kind));
+        saved_path_elems = calloc(total_vars, sizeof(ast_list*));
+        saved_path_types = calloc(total_vars, sizeof(var_path_type));
+        bool allocation_failed = total_vars > 0 &&
+            (!saved_var_names || !saved_var_kinds || !saved_var_inner_kinds ||
+             !saved_path_elems || !saved_path_types);
+        if (!allocation_failed) {
             for (int vi = 0; vi < total_vars; vi++) {
                 transform_var *var = transform_var_at(ctx->var_ctx, vi);
                 if (var && var->is_visible && var->name) {
                     saved_var_names[saved_var_count] = strdup(var->name);
-                    saved_var_kinds[saved_var_count] = var->kind;
+                    if (!saved_var_names[saved_var_count]) {
+                        allocation_failed = true;
+                        break;
+                    }
+                    saved_var_kinds[saved_var_count] = with_varlen_list(var) ? VAR_KIND_PROJECTED : var->kind;
+                    saved_var_inner_kinds[saved_var_count] = with_varlen_list(var) ? VAR_KIND_EDGE : var->list_inner_kind;
+                    saved_path_elems[saved_var_count] = var->path_elements;
+                    saved_path_types[saved_var_count] = var->path_type;
                     saved_var_count++;
                 }
             }
+        }
+        if (allocation_failed) {
+            for (int i = 0; i < saved_var_count; i++) free(saved_var_names[i]);
+            free(saved_var_names); free(saved_var_kinds); free(saved_var_inner_kinds);
+            free(saved_path_elems); free(saved_path_types);
+            for (int t = 0; t < star_tagged_n; t++) free(star_tagged[t]);
+            free(with_where_pre);
+            ctx->has_error = true;
+            ctx->error_message = strdup("Memory allocation failed in WITH metadata projection");
+            return -1;
         }
     } else if (with->items && with->items->count > 0) {
         source_kinds = calloc(with->items->count, sizeof(var_kind));
         inner_kinds = calloc(with->items->count, sizeof(var_kind));
         saved_path_elems = calloc(with->items->count, sizeof(ast_list*));
         saved_path_types = calloc(with->items->count, sizeof(var_path_type));
+        if (!source_kinds || !inner_kinds || !saved_path_elems || !saved_path_types) {
+            free(source_kinds); free(inner_kinds); free(saved_path_elems); free(saved_path_types);
+            free(with_where_pre);
+            ctx->has_error = true;
+            ctx->error_message = strdup("Memory allocation failed in WITH metadata projection");
+            return -1;
+        }
         if (source_kinds) {
             for (int i = 0; i < with->items->count; i++) {
                 cypher_return_item *item = (cypher_return_item*)with->items->items[i];
@@ -1008,13 +1101,13 @@ with_star_columns_done:
                     cypher_identifier *id = (cypher_identifier*)item->expr;
                     transform_var *var = transform_var_lookup(ctx->var_ctx, id->name);
                     if (var) {
-                        source_kinds[i] = var->kind;
+                        source_kinds[i] = with_varlen_list(var) ? VAR_KIND_PROJECTED : var->kind;
                         /* T-0370: `WITH nodes, ...` re-projects a collected
                          * entity list — keep its inner kind so a later
                          * UNWIND still rebinds elements as nodes/edges
                          * (List12 [1]/[2]). */
-                        if (inner_kinds && var->kind == VAR_KIND_PROJECTED)
-                            inner_kinds[i] = var->list_inner_kind;
+                        if (inner_kinds && (with_varlen_list(var) || var->kind == VAR_KIND_PROJECTED))
+                            inner_kinds[i] = with_varlen_list(var) ? VAR_KIND_EDGE : var->list_inner_kind;
                         if (var->kind == VAR_KIND_PATH && saved_path_elems) {
                             saved_path_elems[i] = var->path_elements;
                             saved_path_types[i] = var->path_type;
@@ -1036,7 +1129,7 @@ with_star_columns_done:
                             cypher_identifier *aid = (cypher_identifier*)fc->args->items[0];
                             transform_var *src = transform_var_lookup(ctx->var_ctx, aid->name);
                             if (src && (src->kind == VAR_KIND_NODE ||
-                                        src->kind == VAR_KIND_EDGE)) {
+                                        (src->kind == VAR_KIND_EDGE && !with_varlen_list(src)))) {
                                 inner_kinds[i] = src->kind;
                             }
                         }
@@ -1083,7 +1176,10 @@ with_star_columns_done:
                        sql_ident(_idbuf, sizeof(_idbuf), saved_var_names[i])); }
 
             var_kind kind = saved_var_kinds[i];
-            if (kind == VAR_KIND_NODE) {
+            if (kind == VAR_KIND_PATH) {
+                transform_var_register_path(ctx->var_ctx, saved_var_names[i], select_expr,
+                                            saved_path_elems[i], saved_path_types[i]);
+            } else if (kind == VAR_KIND_NODE) {
                 transform_var_register_node(ctx->var_ctx, saved_var_names[i], select_expr, NULL);
                 transform_var_set_alias_is_id(ctx->var_ctx, saved_var_names[i], true);
             } else if (kind == VAR_KIND_EDGE) {
@@ -1091,6 +1187,8 @@ with_star_columns_done:
                 transform_var_set_alias_is_id(ctx->var_ctx, saved_var_names[i], true);
             } else {
                 transform_var_register_projected(ctx->var_ctx, saved_var_names[i], select_expr);
+                transform_var *dst = transform_var_lookup(ctx->var_ctx, saved_var_names[i]);
+                if (dst) dst->list_inner_kind = saved_var_inner_kinds[i];
                 for (int t = 0; t < star_tagged_n; t++) {
                     if (strcmp(star_tagged[t], saved_var_names[i]) != 0) continue;
                     char tag_ref[400], tb[320];
@@ -1103,6 +1201,7 @@ with_star_columns_done:
         }
         free(saved_var_names);
         free(saved_var_kinds);
+        free(saved_var_inner_kinds);
         for (int t = 0; t < star_tagged_n; t++) free(star_tagged[t]);
     } else {
         /* Register new variables from WITH projections and build SELECT list */

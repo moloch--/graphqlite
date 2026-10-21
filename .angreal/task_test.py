@@ -284,8 +284,9 @@ angreal test tck --debug                  # leak extension debug to stderr
 - Stdout: pass/fail/error/skipped totals + top-10 failing feature files.
 
 ## Exit code
-Returns 0 if the harness completed (regardless of scenario failures);
-non-zero only on harness errors. Regression gating happens in CI (TCK-12).
+Returns 0 when every scenario passes or is skipped; returns non-zero for
+scenario failures, scenario errors, or harness setup errors. CI also compares
+the report against the committed conformance baseline.
 
 ## Prerequisites
 - Extension must be built (auto-built if missing).

@@ -7,6 +7,7 @@
 #include "test_scanner.h"
 #include "test_parser.h"
 #include "test_schema.h"
+#include "test_regex.h"
 
 /* Forward declarations for modular test suites */
 int init_transform_create_suite(void);
@@ -62,6 +63,12 @@ int main(void)
     }
     
     /* Add test suites */
+    if (init_regex_suite() != CUE_SUCCESS) {
+        fprintf(stderr, "Failed to add regex suite\n");
+        CU_cleanup_registry();
+        return CU_get_error();
+    }
+
     if (init_parser_keywords_suite() != CUE_SUCCESS) {
         fprintf(stderr, "Failed to add parser keywords suite\n");
         CU_cleanup_registry();

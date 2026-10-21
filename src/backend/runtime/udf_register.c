@@ -208,6 +208,10 @@ int graphqlite_register_helper_udfs(sqlite3 *db)
   rc = sqlite3_create_function(db, "_gql_apoc_text_indexof", -1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, 0, gql_apoc_text_indexof, 0, 0);
   if (rc != SQLITE_OK) return rc;
 
+  rc = sqlite3_create_function(db, "_gql_shortest_prefix", 7, SQLITE_UTF8, 0,
+                         gql_shortest_prefix_func, 0, 0);
+  if (rc != SQLITE_OK) return rc;
+
   rc = sqlite3_create_function(db, "regexp", 2, SQLITE_UTF8, 0,
                          regexp_func, 0, 0);
   if (rc != SQLITE_OK) return rc;

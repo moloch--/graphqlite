@@ -156,6 +156,14 @@ struct cypher_transform_context {
     } *optional_defer_pairs;
     int optional_defer_pairs_count;
     int optional_defer_pairs_capacity;
+    /* SQL binding of each variable-length pattern (including WITH-bound
+     * relationship lists, whose public alias remains the original value). */
+    struct {
+        const cypher_rel_pattern *pattern; /* borrowed AST */
+        char *alias; /* owned */
+    } *varlen_bindings;
+    int varlen_bindings_count;
+    bool grouping_optional_varlen;
 };
 
 /* Result structure for executed queries */
@@ -343,11 +351,14 @@ int finalize_sql_generation(cypher_transform_context *ctx);
 
 /* Variable-length relationship SQL generation */
 /* anchor_ids_sql: optional `SELECT node_id ...` restricting the start node
- * of every walk (NULL = unanchored). See build_anchor_ids_sql(). */
+ * of every walk (NULL = unanchored). See build_anchor_ids_sql().
+ * shortest_alias: optional marker alias enabling shortest-prefix BFS pruning. */
 int generate_varlen_cte(cypher_transform_context *ctx, cypher_rel_pattern *rel,
                        const char *source_alias, const char *target_alias,
                        const char *cte_name,
-                        const char *anchor_ids_sql);
+                        const char *anchor_ids_sql,
+                        const char *shortest_alias, bool single_shortest,
+                        const char *bound_edge_ids_sql);
 void prepend_cte_to_sql(cypher_transform_context *ctx);
 
 /* Result management */

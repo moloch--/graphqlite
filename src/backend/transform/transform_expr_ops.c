@@ -102,6 +102,20 @@ int transform_label_expression(cypher_transform_context *ctx, cypher_label_expr 
      * alias IS the id; for a fresh MATCH node/edge it is alias.id. */
     transform_var *var = transform_var_lookup(ctx->var_ctx, id->name);
     bool is_edge = var && var->kind == VAR_KIND_EDGE;
+    /* Projected values can contain complete node/relationship JSON, as in
+     * ALL(n IN nodes(p) WHERE n:User). Their alias is a value, not a node id.
+     * Keep null propagation and resolve relationship types dynamically too. */
+    if (var && var->kind == VAR_KIND_PROJECTED &&
+        !transform_var_alias_is_id(ctx->var_ctx, id->name)) {
+        append_sql(ctx, "(CASE WHEN %s IS NULL THEN NULL "
+                   "WHEN CASE WHEN json_valid(%s) THEN json_type(%s, '$.type') = 'text' ELSE 0 END "
+                   "THEN _gql_type(%s) = ", alias, alias, alias, alias);
+        append_string_literal(ctx, label_expr->label_name);
+        append_sql(ctx, " ELSE EXISTS (SELECT 1 FROM json_each(_gql_labels(%s)) WHERE value = ", alias);
+        append_string_literal(ctx, label_expr->label_name);
+        append_sql(ctx, ") END)");
+        return 0;
+    }
     bool alias_is_id = transform_var_alias_is_id(ctx->var_ctx, id->name) ||
                        (var && var->kind == VAR_KIND_PROJECTED);
     char idref[256];
@@ -1096,6 +1110,18 @@ int transform_property_access(cypher_transform_context *ctx, cypher_property *pr
     /* Handle function call base: startNode(r).name, endNode(r).name */
     if (prop->expr->type == AST_NODE_FUNCTION_CALL) {
         cypher_function_call *func = (cypher_function_call*)prop->expr;
+        /* Datetime constructors and their qualified variants return temporal
+         * values. Use the same accessor as a datetime projected through WITH,
+         * including UTC conversion and fractional epoch fields. */
+        if (func->function_name &&
+            strncasecmp(func->function_name, "datetime", 8) == 0) {
+            append_sql(ctx, "_gql_temporal_field(");
+            if (transform_expression(ctx, prop->expr) < 0) return -1;
+            append_sql(ctx, ", ");
+            append_string_literal(ctx, prop->property_name);
+            append_sql(ctx, ")");
+            return 0;
+        }
         if (func->function_name &&
             (strcasecmp(func->function_name, "startNode") == 0 ||
              strcasecmp(func->function_name, "endNode") == 0)) {
